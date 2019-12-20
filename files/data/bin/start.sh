@@ -21,10 +21,10 @@ chown -R www-data:www-data /var/log/php
 
 # Add Time Tracking mod from robintoy - assumes database already modified
 
-wget -O /tmp/file.zip https://github.com/osTicket/osTicket/files/2845027/osTicket_v1.11-TimeTracking_Mod.zip
-unzip /tmp/file.zip -d /tmp
-cp -a /tmp/osTicket_v1.11-TimeTracking_Mod/include/* /data/upload/include/
-cp -a /tmp/osTicket_v1.11-TimeTracking_Mod/scp/* /data/upload/scp/
+#wget -O /tmp/file.zip https://github.com/osTicket/osTicket/files/2845027/osTicket_v1.11-TimeTracking_Mod.zip
+#unzip /tmp/file.zip -d /tmp
+#cp -a /tmp/osTicket_v1.11-TimeTracking_Mod/include/* /data/upload/include/
+#cp -a /tmp/osTicket_v1.11-TimeTracking_Mod/scp/* /data/upload/scp/
 
 #Launch supervisor to manage processes
 exec /usr/bin/supervisord -c /data/supervisord.conf
