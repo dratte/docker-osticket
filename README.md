@@ -3,7 +3,7 @@ docker-osticket
 
 # Introduction
 
-Docker image for running version 1.14.1 of [OSTicket](http://osticket.com/).
+Docker image for running version 1.15.2 of [OSTicket](http://osticket.com/).
 
 This image has been created from the original docker-osticket image by [Petter A. Helset](mailto:petter@helset.eu).
 
@@ -16,7 +16,7 @@ It has a few modifications:
   * Automates configuration file & database installation
   * EMail support
 
-OSTicket is being served by [nginx](http://wiki.nginx.org/Main) using [PHP-FPM](http://php-fpm.org/) with PHP 7.2.
+OSTicket is being served by [nginx](http://wiki.nginx.org/Main) using [PHP-FPM](http://php-fpm.org/) with PHP 7.3.
 PHP7's [mail](http://php.net/manual/en/function.mail.php) function is configured to use [msmtp](http://msmtp.sourceforge.net/) to send out-going messages.
 
 The `setup/` directory has been renamed as `setup_hidden/` and the file system permissions deny nginx access to this
