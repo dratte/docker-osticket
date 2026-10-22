@@ -1,0 +1,2394 @@
+diff --git a/include/class.search.php b/include/class.search.php
+index 829115f..fff648e 100755
+--- a/include/class.search.php
++++ b/include/class.search.php
+@@ -1329,6 +1329,8 @@ class AssigneeChoiceField extends ChoiceField {
+             $items = array(
+                 'M' => __('Me'),
+                 'T' => __('One of my teams'),
++                // Tickets where my email is an active collaborator
++                'C' => __('Me (as collaborator)'),
+             );
+             $assignees = Staff::getStaffMembers(array('staff' => $thisstaff));
+ 
+@@ -1398,6 +1400,16 @@ class AssigneeChoiceField extends ChoiceField {
+                 case 'M':
+                     $agents[] = $thisstaff->getId();
+                     break;
++                case 'C':
++                    $wantCollab = true;
++                    if ($thisstaff && $thisstaff->getEmail())
++                        $collab = Collaborator::objects()
++                            ->filter(array(
++                                'user__emails__address' => $thisstaff->getEmail(),
++                                'flags__hasbit' => Collaborator::FLAG_ACTIVE,
++                            ))
++                            ->values_flat('thread_id');
++                    break;
+                 case 's':
+                     $agents[] = (int) substr($id, 1);
+                     break;
+@@ -1417,6 +1429,11 @@ class AssigneeChoiceField extends ChoiceField {
+                 $constraints['team_id__in'] = $teams;
+             if ($agents)
+                 $constraints['staff_id__in'] = $agents;
++            if (isset($collab))
++                $constraints['thread__id__in'] = $collab;
++            if (!$constraints && !empty($wantCollab))
++                // Only "Me (as collaborator)" and no email on file
++                $constraints['ticket_id'] = 0;
+             $Q->add(Q::any($constraints));
+         }
+         return $Q;
+diff --git a/include/class.task.php b/include/class.task.php
+index 4c4363a..8ba1c31 100644
+--- a/include/class.task.php
++++ b/include/class.task.php
+@@ -269,7 +269,11 @@ class Task extends TaskModel implements RestrictedAccess, Threadable {
+     }
+ 
+     function getStatus() {
+-        return $this->isOpen() ? __('Open') : __('Completed');
++        // Plugins (e.g. Task Statuses) may supply a more specific name
++        $data = array('id' => $this->getId(), 'isopen' => $this->isOpen(),
++            'status' => $this->isOpen() ? __('Open') : __('Completed'));
++        Signal::send('task.status.name', $this, $data);
++        return $data['status'];
+     }
+ 
+     function getTitle() {
+diff --git a/include/plugins/search-plus/backend.php b/include/plugins/search-plus/backend.php
+new file mode 100644
+index 0000000..518d1ab
+--- /dev/null
++++ b/include/plugins/search-plus/backend.php
+@@ -0,0 +1,77 @@
++<?php
++/*
++ * Drop-in replacement for osTicket's MysqlSearchBackend. Indexing is
++ * inherited unchanged; only ticket keyword matching (find) differs.
++ */
++class SearchPlusBackend extends MysqlSearchBackend {
++    static $id = 'mysql';   // same id: replaces the stock backend
++
++    function find($query, QuerySet $criteria, $addRelevance=true, $options=array()) {
++        if ($criteria->model && $criteria->model !== 'Ticket')
++            return parent::find($query, $criteria, $addRelevance, $options);
++
++        list($pos, $neg) = SearchPlusPlugin::parse($query);
++        if (!$pos)
++            return $criteria;
++
++        $criteria = clone $criteria;
++        list($where, $having, $rel) = SearchPlusPlugin::sqlParts($pos, $neg);
++        $P = TABLE_PREFIX;
++        // Cross-search (staff only): words in a ticket's tasks also count.
++        // Not for the client portal, since tasks are internal.
++        global $thisstaff;
++        $cross = $thisstaff && !empty(SearchPlusPlugin::$opts['cross']);
++
++        // One row per indexed item, mapped to the ticket it belongs to:
++        //   T = ticket (number, subject, custom fields)
++        //   H = thread entry of a ticket
++        //   U = requester (name, email, contact fields) -> all their tickets
++        //   (cross-search) H in a task's thread -> the task's ticket, and
++        //   the task's form fields (title, ...) -> the task's ticket
++        $threadTypes = $cross ? "'T', 'C', 'A'" : "'T', 'C'";
++        $threadTicket = $cross
++            ? "IF(Z3.`object_type` = 'A', ZK.`object_id`, Z3.`object_id`)"
++            : "Z3.`object_id`";
++        $taskJoin = $cross ? "
++              LEFT JOIN `{$P}task` ZK
++                     ON (Z3.`object_type` = 'A' AND ZK.`id` = Z3.`object_id`
++                         AND ZK.`object_type` = 'T')" : "";
++        $taskFields = $cross ? "
++            UNION ALL
++              SELECT TK.`object_id`, FV.`value`
++              FROM `{$P}form_entry` FE
++              JOIN `{$P}form_entry_values` FV ON (FV.`entry_id` = FE.`id`)
++              JOIN `{$P}task` TK ON (TK.`id` = FE.`object_id` AND TK.`object_type` = 'T')
++              WHERE FE.`object_type` = 'A'" : "";
++        $sql = "(SELECT M.ticket_id, {$rel} AS relevance FROM (
++              SELECT COALESCE({$threadTicket}, Z5.`ticket_id`, Z8.`ticket_id`) AS ticket_id,
++                     CONCAT_WS(' ', S.`title`, S.`content`) AS txt
++              FROM `{$P}_search` S
++              LEFT JOIN `{$P}thread_entry` Z2
++                     ON (S.`object_type` = 'H' AND S.`object_id` = Z2.`id`)
++              LEFT JOIN `{$P}thread` Z3
++                     ON (Z2.`thread_id` = Z3.`id` AND Z3.`object_type` IN ({$threadTypes})){$taskJoin}
++              LEFT JOIN `{$P}ticket` Z5
++                     ON (S.`object_type` = 'T' AND S.`object_id` = Z5.`ticket_id`)
++              LEFT JOIN `{$P}user` Z6
++                     ON (S.`object_type` = 'U' AND S.`object_id` = Z6.`id`)
++              LEFT JOIN `{$P}ticket` Z8
++                     ON (Z8.`user_id` = Z6.`id`)
++              WHERE S.`object_type` IN ('T', 'H', 'U'){$taskFields}
++            ) M
++            WHERE M.ticket_id IS NOT NULL AND {$where}
++            GROUP BY M.ticket_id
++            HAVING {$having}) Z1";
++
++        if ($addRelevance) {
++            $criteria = $criteria->extra(array(
++                'select' => array('__relevance__' => 'Z1.`relevance`'),
++            ));
++        }
++        $criteria->extra(array('tables' => array($sql)));
++        $criteria->extra(array('order_by' => array(
++            array(new SqlCode('Z1.relevance', 'DESC')))));
++        $criteria->filter(array('ticket_id' => new SqlCode('Z1.`ticket_id`')));
++        return $criteria;
++    }
++}
+diff --git a/include/plugins/search-plus/config.php b/include/plugins/search-plus/config.php
+new file mode 100644
+index 0000000..8275ab5
+--- /dev/null
++++ b/include/plugins/search-plus/config.php
+@@ -0,0 +1,43 @@
++<?php
++require_once INCLUDE_DIR . 'class.plugin.php';
++require_once INCLUDE_DIR . 'class.forms.php';
++
++class SearchPlusConfig extends PluginConfig {
++
++    function getOptions() {
++        return array(
++            'tickets' => new BooleanField(array(
++                'label' => 'Ticket search',
++                'default' => true,
++                'configuration' => array(
++                    'desc' => 'Use Search Plus for ticket keyword searches
++                        (search box, Advanced Search keywords, client portal)',
++                ),
++            )),
++            'tasks' => new BooleanField(array(
++                'label' => 'Task search',
++                'default' => true,
++                'configuration' => array(
++                    'desc' => 'Use Search Plus for the Tasks search box
++                        (searches task number, task fields and task threads)',
++                ),
++            )),
++            'cross' => new BooleanField(array(
++                'label' => 'Cross-search tickets and tasks',
++                'default' => true,
++                'configuration' => array(
++                    'desc' => 'Staff ticket searches also match words in the
++                        ticket\'s tasks; task searches also match words in the
++                        parent ticket (subject, fields and thread)',
++                ),
++            )),
++            'max_terms' => new TextboxField(array(
++                'label' => 'Maximum search words',
++                'default' => '8',
++                'hint' => 'Extra words beyond this are ignored.',
++                'validator' => 'number',
++                'configuration' => array('size' => 4, 'length' => 2),
++            )),
++        );
++    }
++}
+diff --git a/include/plugins/search-plus/plugin.php b/include/plugins/search-plus/plugin.php
+new file mode 100644
+index 0000000..3fbe02a
+--- /dev/null
++++ b/include/plugins/search-plus/plugin.php
+@@ -0,0 +1,15 @@
++<?php
++
++return array(
++    'id' =>             'community:search-plus', # notrans
++    'version' =>        '1.1.0',
++    'ost_version' =>    '1.17',
++    'name' =>           /* trans */ 'Search Plus',
++    'author' =>         'Community contributors',
++    'description' =>    /* trans */ 'Replaces the built-in ticket keyword
++        search and the task search. Every word must match (in any order),
++        words match anywhere inside other words, there is no minimum length,
++        * works as a wildcard, "quoted phrases" and -excluded words are
++        supported.',
++    'plugin' =>         'searchplus.php:SearchPlusPlugin',
++);
+diff --git a/include/plugins/search-plus/searchplus.php b/include/plugins/search-plus/searchplus.php
+new file mode 100644
+index 0000000..d55a185
+--- /dev/null
++++ b/include/plugins/search-plus/searchplus.php
+@@ -0,0 +1,179 @@
++<?php
++/*********************************************************************
++ * Search Plus plugin for osTicket 1.17 / 1.18
++ *
++ * Ticket keyword search (staff search box, Advanced Search "Keywords",
++ * client portal) and the staff Tasks search box are replaced with:
++ *
++ *   printer jam      every word must match, in any order, anywhere in the
++ *                    ticket (subject, any thread entry, custom fields,
++ *                    requester name/email)
++ *   ab               no minimum word length
++ *   rint             words match inside other words ("printer")
++ *   PN*100           * matches any run of characters, ? a single one
++ *   "fuser unit"     exact phrase
++ *   -closed          exclude tickets containing the word
++ *
++ * Matching is case- and accent-insensitive. It uses the existing
++ * %TABLE_PREFIX%_search index table (kept up to date by osTicket), so no
++ * schema change is needed. User / organization lookups are unchanged.
++ *********************************************************************/
++
++require_once INCLUDE_DIR . 'class.plugin.php';
++require_once INCLUDE_DIR . 'class.signal.php';
++require_once __DIR__ . '/config.php';
++
++class SearchPlusPlugin extends Plugin {
++    var $config_class = 'SearchPlusConfig';
++
++    static $opts = null;
++
++    function isMultiInstance() {
++        return false;
++    }
++
++    function bootstrap() {
++        $c = $this->getConfig();
++        self::$opts = array(
++            'tickets' => (bool) $c->get('tickets', true),
++            'tasks' => (bool) $c->get('tasks', true),
++            'cross' => (bool) $c->get('cross', true),
++            'max_terms' => max(1, min(20, (int) ($c->get('max_terms') ?: 8))),
++        );
++
++        if (self::$opts['tickets']) {
++            // Replace the stock MySQL backend (same id). Plugins bootstrap
++            // before osTicket creates its search interface.
++            require_once INCLUDE_DIR . 'class.search.php';
++            require_once __DIR__ . '/backend.php';
++            SearchPlusBackend::register();
++        }
++        if (self::$opts['tasks'])
++            Signal::connect('tasks.search', array(__CLASS__, 'onTaskSearch'));
++    }
++
++    /* ---------------------------------------------------------------
++     * Query parsing
++     * ------------------------------------------------------------- */
++
++    /**
++     * Returns array(positive LIKE patterns, negative LIKE patterns).
++     */
++    static function parse($query) {
++        $max = self::$opts ? self::$opts['max_terms'] : 8;
++        $pos = $neg = array();
++        preg_match_all('/(-?)"([^"]*)"?|(\S+)/u', (string) $query, $M, PREG_SET_ORDER);
++        foreach ($M as $m) {
++            $not = false;
++            if (isset($m[3]) && $m[3] !== '') {
++                $t = $m[3];
++                if ($t[0] === '-' && strlen($t) > 1) { $not = true; $t = substr($t, 1); }
++                $t = ltrim($t, '+');
++                $t = str_replace('"', '', $t);
++            } else {
++                $not = $m[1] === '-';
++                $t = $m[2];
++            }
++            $t = trim(preg_replace('/\s+/u', ' ', $t));
++            if ($t === '' || trim($t, '*?') === '')
++                continue;
++            $like = self::toLike($t);
++            if ($not)
++                $neg[] = $like;
++            elseif (count($pos) < $max)
++                $pos[] = $like;
++        }
++        return array(array_values(array_unique($pos)),
++            array_values(array_unique($neg)));
++    }
++
++    /** "PN*100" -> "%PN%100%" with LIKE metacharacters escaped. */
++    static function toLike($term) {
++        $t = addcslashes($term, '\\%_');
++        $t = strtr($t, array('*' => '%', '?' => '_'));
++        $t = preg_replace('/%+/', '%', "%{$t}%");
++        // ':' followed by digits can be read as a parameter marker by the
++        // ORM; '_' (any single character) still matches "10:30" etc.
++        return str_replace(':', '_', $t);
++    }
++
++    /**
++     * Build WHERE / HAVING / relevance SQL for a derived table with a
++     * text column `txt`, grouped by the object id.
++     */
++    static function sqlParts($pos, $neg, $col='M.txt') {
++        $any = $have = $rel = array();
++        foreach ($pos as $p) {
++            $l = sprintf('%s LIKE %s', $col, db_input($p));
++            $any[] = $l;
++            $have[] = "SUM($l) > 0";
++            $rel[] = "SUM($l)";
++        }
++        foreach ($neg as $n) {
++            $l = sprintf('%s LIKE %s', $col, db_input($n));
++            $any[] = $l;
++            $have[] = "SUM($l) = 0";
++        }
++        return array(
++            '(' . implode(' OR ', $any) . ')',
++            implode(' AND ', $have),
++            '(' . implode(' + ', $rel) . ')',
++        );
++    }
++
++    /* ---------------------------------------------------------------
++     * Tasks
++     * ------------------------------------------------------------- */
++
++    /**
++     * Signal sent from include/staff/tasks.inc.php (see patch). Filters
++     * the task QuerySet in place and marks the search as handled.
++     */
++    static function onTaskSearch($tasks, &$data) {
++        list($pos, $neg) = self::parse(@$data['query']);
++        if (!$pos)
++            return;     // nothing usable: fall back to stock behaviour
++
++        list($where, $having) = self::sqlParts($pos, $neg);
++        $P = TABLE_PREFIX;
++        $cross = !empty(self::$opts['cross']);
++
++        // Which threads count for which task: the task's own thread, and
++        // (cross-search) the parent ticket's thread for each of its tasks.
++        $threadMap = "SELECT TH.id AS thread_id, TH.object_id AS task_id
++              FROM `{$P}thread` TH WHERE TH.object_type = 'A'";
++        if ($cross)
++            $threadMap .= "
++            UNION ALL
++              SELECT TH.id, TK.id FROM `{$P}thread` TH
++              JOIN `{$P}task` TK ON (TK.object_type = 'T' AND TK.object_id = TH.object_id)
++              WHERE TH.object_type = 'T'";
++
++        $sql = "(SELECT M.task_id FROM (
++              SELECT T.id AS task_id, T.number AS txt FROM `{$P}task` T
++            UNION ALL
++              SELECT FE.object_id, FV.value
++              FROM `{$P}form_entry` FE
++              JOIN `{$P}form_entry_values` FV ON (FV.entry_id = FE.id)
++              WHERE FE.object_type = 'A'
++            UNION ALL
++              SELECT MP.task_id, CONCAT_WS(' ', S.title, S.content)
++              FROM `{$P}_search` S
++              JOIN `{$P}thread_entry` E ON (S.object_type = 'H' AND S.object_id = E.id)
++              JOIN ({$threadMap}) MP ON (MP.thread_id = E.thread_id)"
++            . ($cross ? "
++            UNION ALL
++              SELECT TK.id, CONCAT_WS(' ', S.title, S.content)
++              FROM `{$P}_search` S
++              JOIN `{$P}task` TK ON (TK.object_type = 'T' AND TK.object_id = S.object_id)
++              WHERE S.object_type = 'T'" : "") . "
++            ) M
++            WHERE {$where}
++            GROUP BY M.task_id
++            HAVING {$having}) ZSP";
++
++        $tasks->extra(array('tables' => array($sql)));
++        $tasks->filter(array('id' => new SqlCode('ZSP.`task_id`')));
++        $data['handled'] = true;
++    }
++}
+diff --git a/include/plugins/task-status/config.php b/include/plugins/task-status/config.php
+new file mode 100644
+index 0000000..03ab312
+--- /dev/null
++++ b/include/plugins/task-status/config.php
+@@ -0,0 +1,32 @@
++<?php
++require_once INCLUDE_DIR . 'class.plugin.php';
++require_once INCLUDE_DIR . 'class.forms.php';
++
++class TaskStatusConfig extends PluginConfig {
++
++    function getOptions() {
++        return array(
++            'statuses' => new TextareaField(array(
++                'label' => 'Task statuses',
++                'required' => true,
++                'default' => "Open | open\nIn Progress | open\nWaiting on Parts | open\nCompleted | closed\nInactive | closed",
++                'hint' => 'One per line: Name | open  or  Name | closed.
++                    "closed" statuses behave like a closed task (Closed tab,
++                    no longer counted as open). The first open status is used
++                    for new and reopened tasks; the first closed status is used
++                    when a task is closed without choosing one (Close button,
++                    bulk close). Tasks whose status is renamed or removed show
++                    the first status of the same state.',
++                'configuration' => array('rows' => 8, 'cols' => 40, 'html' => false),
++            )),
++        );
++    }
++
++    function pre_save(&$config, &$errors) {
++        $list = TaskStatusPlugin::parseList(@$config['statuses']);
++        $states = array_unique(array_values($list));
++        if (!in_array('open', $states) || !in_array('closed', $states))
++            $errors['err'] = 'Define at least one "open" and one "closed" status.';
++        return !$errors;
++    }
++}
+diff --git a/include/plugins/task-status/plugin.php b/include/plugins/task-status/plugin.php
+new file mode 100644
+index 0000000..3d641bc
+--- /dev/null
++++ b/include/plugins/task-status/plugin.php
+@@ -0,0 +1,13 @@
++<?php
++
++return array(
++    'id' =>             'community:task-status', # notrans
++    'version' =>        '1.1.0',
++    'ost_version' =>    '1.17',
++    'name' =>           /* trans */ 'Task Statuses',
++    'author' =>         'Community contributors',
++    'description' =>    /* trans */ 'Gives tasks their own list of statuses
++        (e.g. In Progress, Waiting on Parts, Inactive, Completed). Each status
++        is treated as open or closed, like ticket statuses.',
++    'plugin' =>         'taskstatus.php:TaskStatusPlugin',
++);
+diff --git a/include/plugins/task-status/taskstatus.php b/include/plugins/task-status/taskstatus.php
+new file mode 100644
+index 0000000..acd3176
+--- /dev/null
++++ b/include/plugins/task-status/taskstatus.php
+@@ -0,0 +1,268 @@
++<?php
++/*********************************************************************
++ * Task Statuses plugin for osTicket 1.17 / 1.18
++ *
++ * osTicket tasks are only open or closed (shown as "Open" / "Completed").
++ * This plugin adds named statuses on top of that, each mapped to the open
++ * or closed state:
++ *
++ *  - The Status drop-down on task Post Update / Post Internal Note lists
++ *    the configured statuses instead of Open / Closed.
++ *  - The task header, preview, print view, the ticket's Tasks tab and the
++ *    Tasks list "Status" column show the named status.
++ *  - Closing / reopening a task any other way (Close button, bulk action,
++ *    closing the parent ticket) sets the default closed / open status.
++ *
++ * Statuses are stored in %TABLE_PREFIX%task_status (created on first use).
++ *********************************************************************/
++
++require_once INCLUDE_DIR . 'class.plugin.php';
++require_once INCLUDE_DIR . 'class.signal.php';
++require_once __DIR__ . '/config.php';
++
++class TaskStatusPlugin extends Plugin {
++    var $config_class = 'TaskStatusConfig';
++
++    static $list = null;        // name => 'open' | 'closed'
++    static $default = array();  // state => default name
++    static $cache = array();    // task_id => stored name|false
++    static $pending = array();  // task_id => name chosen in this request
++    static $schemaOk = false;
++
++    function isMultiInstance() {
++        return false;
++    }
++
++    function bootstrap() {
++        $list = self::parseList($this->getConfig()->get('statuses'));
++        foreach ($list as $name => $state)
++            if (!isset(self::$default[$state]))
++                self::$default[$state] = $name;
++        if (!isset(self::$default['open']) || !isset(self::$default['closed']))
++            return;     // misconfigured: leave stock behaviour alone
++        self::$list = $list;
++
++        Signal::connect('task.status.name', array(__CLASS__, 'onStatusName'));
++        Signal::connect('object.view', array(__CLASS__, 'onTaskView'), 'Task');
++        Signal::connect('threadentry.created', array(__CLASS__, 'onEntryCreated'));
++        Signal::connect('model.updated', array(__CLASS__, 'onTaskUpdated'), 'Task');
++        Signal::connect('model.deleted', array(__CLASS__, 'onTaskDeleted'), 'Task');
++        Signal::connect('ajax.scp', function($dispatcher) {
++            $dispatcher->append(url_post('^/taskstatus/(?P<id>\d+)$',
++                function($id) { TaskStatusPlugin::ajaxSetStatus($id); }));
++        });
++    }
++
++    /** "Name | open" lines -> array(name => state) */
++    static function parseList($text) {
++        $list = array();
++        foreach (preg_split('/\R/u', (string) $text) as $line) {
++            $parts = array_map('trim', explode('|', $line, 2));
++            if ($parts[0] === '')
++                continue;
++            $state = strtolower(@$parts[1] ?: 'open');
++            if (!in_array($state, array('open', 'closed')))
++                $state = 'open';
++            $name = mb_substr($parts[0], 0, 64);
++            if (!isset($list[$name]))
++                $list[$name] = $state;
++        }
++        return $list;
++    }
++
++    /* ---------------------------------------------------------------
++     * Storage
++     * ------------------------------------------------------------- */
++
++    static function table() {
++        return TABLE_PREFIX . 'task_status';
++    }
++
++    static function ensureSchema() {
++        if (self::$schemaOk)
++            return true;
++        return self::$schemaOk = (bool) db_query('CREATE TABLE IF NOT EXISTS `'
++            . self::table() . '` (
++              `task_id` int(11) unsigned NOT NULL,
++              `status` varchar(64) NOT NULL,
++              `updated` datetime NOT NULL,
++              PRIMARY KEY (`task_id`)
++            ) DEFAULT CHARSET=utf8');
++    }
++
++    static function getStored($taskId) {
++        $taskId = (int) $taskId;
++        if (!array_key_exists($taskId, self::$cache)) {
++            self::$cache[$taskId] = false;
++            if (self::ensureSchema()
++                && ($res = db_query(sprintf('SELECT status FROM `%s` WHERE task_id=%d',
++                    self::table(), $taskId)))
++                && ($row = db_fetch_array($res)))
++                self::$cache[$taskId] = $row['status'];
++        }
++        return self::$cache[$taskId];
++    }
++
++    static function setStored($taskId, $name) {
++        if (!self::ensureSchema())
++            return false;
++        self::$cache[(int) $taskId] = $name;
++        return db_query(sprintf(
++            'INSERT INTO `%s` (task_id, status, updated) VALUES (%d, %s, NOW())
++             ON DUPLICATE KEY UPDATE status=VALUES(status), updated=NOW()',
++            self::table(), $taskId, db_input($name)));
++    }
++
++    /** Effective status name for a task id in a given state. */
++    static function nameFor($taskId, $isOpen) {
++        $state = $isOpen ? 'open' : 'closed';
++        $name = self::getStored($taskId);
++        if ($name !== false && @self::$list[$name] === $state)
++            return $name;
++        return self::$default[$state];
++    }
++
++    /* ---------------------------------------------------------------
++     * Signal handlers
++     * ------------------------------------------------------------- */
++
++    static function onStatusName($obj, &$data) {
++        if (self::$list && !empty($data['id']))
++            $data['status'] = self::nameFor($data['id'], !empty($data['isopen']));
++    }
++
++    /** Status chosen on Post Update / Post Internal Note. */
++    static function onEntryCreated($entry) {
++        global $thisstaff;
++        if (!self::$list || !$thisstaff || $_SERVER['REQUEST_METHOD'] !== 'POST'
++                || !in_array(@$_POST['a'], array('postreply', 'postnote')))
++            return;
++        $name = trim((string) @$_POST['ts_status']);
++        if ($name === '' || !isset(self::$list[$name]))
++            return;
++        if (!($thread = $entry->getThread()) || $thread->getObjectType() !== 'A'
++                || !($task = $thread->getObject()))
++            return;
++
++        // osTicket changes open/closed right after saving the entry. If the
++        // chosen status keeps the current state, save it now; otherwise
++        // wait for the state change (it may be refused, e.g. not closeable).
++        $wantOpen = self::$list[$name] === 'open';
++        if ($wantOpen === (bool) $task->isOpen())
++            self::setStored($task->getId(), $name);
++        else
++            self::$pending[$task->getId()] = $name;
++    }
++
++    /** Task opened/closed (any route): pick the matching status. */
++    static function onTaskUpdated($task, &$data) {
++        if (!self::$list || !isset($data['dirty']) || !array_key_exists('flags', $data['dirty']))
++            return;
++        $wasOpen = (bool) ((int) $data['dirty']['flags'] & TaskModel::ISOPEN);
++        $isOpen = (bool) $task->isOpen();
++        if ($wasOpen === $isOpen)
++            return;
++        $id = $task->getId();
++        $state = $isOpen ? 'open' : 'closed';
++        $name = @self::$pending[$id];
++        unset(self::$pending[$id]);
++        if (!$name || self::$list[$name] !== $state)
++            $name = self::$default[$state];
++        self::setStored($id, $name);
++    }
++
++    static function onTaskDeleted($task, &$data=null) {
++        if (self::ensureSchema())
++            db_query(sprintf('DELETE FROM `%s` WHERE task_id=%d',
++                self::table(), $task->getId()));
++    }
++
++    /**
++     * Change a task to a named status (from the task's Change Status menu).
++     * Opens/closes the task when the status's state differs, and adds an
++     * internal note recording the change.
++     */
++    static function changeStatus($task, $name, &$error) {
++        global $thisstaff;
++        if (!isset(self::$list[$name])) {
++            $error = __('Unknown status');
++            return false;
++        }
++        $id = $task->getId();
++        $current = self::nameFor($id, $task->isOpen());
++        if ($name === $current)
++            return true;
++
++        $state = self::$list[$name];
++        if ($state === 'closed' && $task->isOpen()) {
++            if (!$task->checkStaffPerm($thisstaff, Task::PERM_CLOSE)) {
++                $error = __('You do not have permission to close this task');
++                return false;
++            }
++            $errors = array();
++            self::$pending[$id] = $name;
++            if (!$task->setStatus('closed', '', $errors) || $task->isOpen()) {
++                unset(self::$pending[$id]);
++                $error = $errors['err'] ?: __('This task cannot be closed');
++                return false;
++            }
++        } elseif ($state === 'open' && !$task->isOpen()) {
++            $errors = array();
++            self::$pending[$id] = $name;
++            if (!$task->setStatus('open', '', $errors) || !$task->isOpen()) {
++                unset(self::$pending[$id]);
++                $error = $errors['err'] ?: __('This task cannot be reopened');
++                return false;
++            }
++        } else {
++            self::setStored($id, $name);
++        }
++        // Make sure the chosen name stuck (state-change handler uses pending)
++        if (self::getStored($id) !== $name)
++            self::setStored($id, $name);
++
++        $errors = array();
++        $task->postNote(array(
++            'title' => __('Status changed'),
++            'note' => sprintf(__('Status changed from <b>%s</b> to <b>%s</b>.'),
++                Format::htmlchars($current), Format::htmlchars($name)),
++        ), $errors, $thisstaff, false);
++        return true;
++    }
++
++    static function ajaxSetStatus($id) {
++        global $thisstaff;
++        if (!$thisstaff)
++            Http::response(403, 'Login required');
++        if (!($task = Task::lookup((int) $id)) || !$task->checkStaffPerm($thisstaff))
++            Http::response(404, 'No such task');
++        $error = '';
++        if (!self::changeStatus($task, trim((string) @$_POST['status']), $error))
++            Http::response(422, Format::htmlchars($error));
++        Http::response(200, JsonDataEncoder::encode(array('ok' => true,
++            'status' => self::nameFor($task->getId(), $task->isOpen()))),
++            'application/json');
++    }
++
++    /** Swap the Open/Closed drop-downs for the named statuses. */
++    static function onTaskView($task, &$data=null) {
++        global $thisstaff;
++        if (!self::$list || !$thisstaff || !defined('OSTSCPINC'))
++            return;
++
++        $current = self::nameFor($task->getId(), $task->isOpen());
++        // Re-select the posted choice if the form is redisplayed with errors
++        if (isset($_POST['ts_status'], $_POST['id']) && (int) $_POST['id'] === (int) $task->getId()
++                && isset(self::$list[$_POST['ts_status']]) && !empty($GLOBALS['errors']))
++            $current = $_POST['ts_status'];
++
++        $statuses = array();
++        foreach (self::$list as $name => $state)
++            $statuses[] = array('name' => $name, 'state' => $state);
++        $json = json_encode(array('statuses' => $statuses, 'current' => $current,
++                'id' => (int) $task->getId(), 'open' => (bool) $task->isOpen(),
++                'saved' => self::nameFor($task->getId(), $task->isOpen())),
++            JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
++        include __DIR__ . '/view.inc.php';
++    }
++}
+diff --git a/include/plugins/task-status/view.inc.php b/include/plugins/task-status/view.inc.php
+new file mode 100644
+index 0000000..ef5a7bf
+--- /dev/null
++++ b/include/plugins/task-status/view.inc.php
+@@ -0,0 +1,103 @@
++<?php
++// Rendered at the top of the staff task view (object.view signal).
++// Expects $json from TaskStatusPlugin::onTaskView().
++if (!defined('OSTSCPINC')) die('Access Denied');
++?>
++<script type="text/javascript">
++(function($) {
++  var cfg = <?php echo $json; ?>;
++
++  function upgrade(formSel) {
++    var $orig = $(formSel).find('select[name="task:status"]').first();
++    if (!$orig.length || $orig.data('ts-done')) return;
++    $orig.data('ts-done', 1);
++
++    // States the agent may pick here (osTicket omits "closed" when the
++    // task can't be closed or the agent lacks permission)
++    var allowed = {};
++    $orig.find('option').each(function() { allowed[this.value] = true; });
++
++    var $sel = $('<select name="ts_status"></select>');
++    $.each(cfg.statuses, function(i, s) {
++      if (!allowed[s.state]) return;
++      $('<option/>').val(s.name).text(s.name).attr('data-state', s.state)
++        .prop('selected', s.name === cfg.current)
++        .appendTo($sel);
++    });
++    if (!$sel.find('option:selected').length)
++      $sel.find('option[data-state="' + $orig.val() + '"]').first().prop('selected', true);
++
++    function sync() {
++      $orig.val($sel.find('option:selected').attr('data-state') || $orig.val());
++    }
++    $sel.on('change', sync);
++    $orig.hide().after($sel);
++    sync();
++  }
++
++  // Task "Change Status" menu (standalone task) and the "Actions" menu
++  // (task opened inside a ticket): list the named statuses
++  function statusItems(canClose) {
++    var html = '';
++    $.each(cfg.statuses, function(i, s) {
++      if (s.name === cfg.saved) return;
++      if (s.state === 'closed' && cfg.open && !canClose) return;
++      var label = $('<div/>').text(s.name).html();
++      html += '<li><a class="no-pjax ts-set" href="#" data-name="' + label.replace(/"/g, '&quot;') +
++        '"><i class="icon-fixed-width ' + (s.state === 'closed' ? 'icon-ok-circle' : 'icon-flag') +
++        '"></i> ' + label + '</a></li>';
++    });
++    return html;
++  }
++
++  function upgradeMenu(sel, replaceAll) {
++    var $ul = $(sel).first();
++    if (!$ul.length || $ul.data('ts-done')) return;
++    $ul.data('ts-done', 1);
++    var $stock = $ul.find('a[href$="/close"], a[href$="/reopen"]').closest('li');
++    // osTicket only offers "Close" to agents who may close this task
++    var canClose = !cfg.open || $ul.find('a[href$="/close"]').length > 0;
++    var items = statusItems(canClose);
++    if (replaceAll) $ul.html(items);
++    else if ($stock.length) { $stock.first().before(items); $stock.remove(); }
++    else $ul.prepend(items);
++    $ul.off('click.ts').on('click.ts', 'a.ts-set', function(e) {
++      e.preventDefault();
++      e.stopImmediatePropagation();
++      var name = $(this).attr('data-name');
++      $.ajax({url: 'ajax.php/taskstatus/' + cfg.id, type: 'POST', data: {status: name}})
++        .done(function() {
++          var $reload = $('a#reload-task[href^="#tickets/"]');
++          if ($reload.length) $reload.trigger('click');   // task inside a ticket
++          else window.location.reload();
++        })
++        .fail(function(xhr) {
++          $.sysAlert('Change Status', xhr.responseText || 'Unable to change the status');
++        });
++      return false;
++    });
++  }
++
++  function init() {
++    upgrade('#task_reply');
++    upgrade('#task_note');
++    upgradeMenu('#action-dropdown-tasks-status ul', true);
++    upgradeMenu('#action-dropdown-task-options ul', false);
++    // The status value in the task header is a Close/Reopen shortcut: make it
++    // open the status menu instead
++    $('th').filter(function() { return $.trim($(this).text()) === 'Status:'; })
++      .next('td').find('a.task-action[href$="/close"], a.task-action[href$="/reopen"]')
++      .removeClass('task-action').addClass('no-pjax').attr('href', '#')
++      .off('click.ts').on('click.ts', function(e) {
++        e.preventDefault();
++        e.stopImmediatePropagation();
++        var $btn = $('[data-dropdown="#action-dropdown-tasks-status"]').first();
++        if ($btn.length) $btn.trigger('click');
++        return false;
++      });
++  }
++
++  // Normal page load, PJAX navigation and tasks loaded by AJAX in a ticket
++  $(function() { setTimeout(init, 0); });
++})(jQuery);
++</script>
+diff --git a/include/plugins/ticket-to-task/config.php b/include/plugins/ticket-to-task/config.php
+new file mode 100644
+index 0000000..c6f308e
+--- /dev/null
++++ b/include/plugins/ticket-to-task/config.php
+@@ -0,0 +1,19 @@
++<?php
++require_once INCLUDE_DIR . 'class.plugin.php';
++require_once INCLUDE_DIR . 'class.forms.php';
++
++class TicketToTaskConfig extends PluginConfig {
++
++    function getOptions() {
++        return array(
++            'allow_delete' => new BooleanField(array(
++                'label' => 'Allow deleting the original',
++                'default' => true,
++                'configuration' => array(
++                    'desc' => 'Offer "Delete the ticket" in the Convert to Task
++                        dialog (only to agents who may delete tickets)',
++                ),
++            )),
++        );
++    }
++}
+diff --git a/include/plugins/ticket-to-task/convert.php b/include/plugins/ticket-to-task/convert.php
+new file mode 100644
+index 0000000..646dc02
+--- /dev/null
++++ b/include/plugins/ticket-to-task/convert.php
+@@ -0,0 +1,340 @@
++<?php
++/*********************************************************************
++ * Convert Ticket to Task plugin for osTicket 1.17 / 1.18
++ *
++ * Adds "Convert to Task" to the staff ticket "More" menu. The dialog asks
++ * for the target ticket number, task title and department, and whether
++ * the original ticket is closed (with a chosen closed status) or deleted.
++ *
++ * Converting:
++ *   1. creates a task on the target ticket (assigned like the original),
++ *   2. copies every message / reply / note of the original thread into
++ *      the task with original author, date and attachments,
++ *   3. adds the original's customer and collaborators to the target ticket,
++ *   4. moves the original's own tasks to the target ticket,
++ *   5. moves Time & Cost entries (if that plugin is installed) to the task,
++ *   6. logs notes on both tickets, then closes or deletes the original.
++ *********************************************************************/
++
++require_once INCLUDE_DIR . 'class.plugin.php';
++require_once INCLUDE_DIR . 'class.signal.php';
++require_once __DIR__ . '/config.php';
++
++class TicketToTaskPlugin extends Plugin {
++    var $config_class = 'TicketToTaskConfig';
++
++    static $opts = null;
++
++    function isMultiInstance() {
++        return false;
++    }
++
++    function bootstrap() {
++        self::$opts = array(
++            'allow_delete' => (bool) $this->getConfig()->get('allow_delete', true),
++        );
++        Signal::connect('ticket.view.more', array(__CLASS__, 'onMoreMenu'), 'Ticket');
++        Signal::connect('ajax.scp', array(__CLASS__, 'onAjax'));
++    }
++
++    /* ---------------------------------------------------------------
++     * Menu + routes
++     * ------------------------------------------------------------- */
++
++    static function canConvert($ticket) {
++        global $thisstaff;
++        return $thisstaff && $ticket
++            && !$ticket->isChild() && !$ticket->isParent()
++            && ($ticket->checkStaffPerm($thisstaff, Ticket::PERM_CLOSE)
++                || (self::$opts['allow_delete']
++                    && $ticket->checkStaffPerm($thisstaff, Ticket::PERM_DELETE)));
++    }
++
++    static function onMoreMenu($ticket, &$extras=null) {
++        if (!self::canConvert($ticket))
++            return;
++        printf('<li><a href="#ajax.php/ticket2task/%d" onclick="javascript:
++                $.dialog($(this).attr(\'href\').substr(1), 201);
++                return false"><i class="icon-tasks"></i> %s</a></li>',
++            $ticket->getId(), Format::htmlchars(__('Convert to Task')));
++    }
++
++    static function onAjax($dispatcher) {
++        // Closures: the dispatcher would instantiate a class callback
++        $dispatcher->append(url_get('^/ticket2task/lookup$',
++            function() { TicketToTaskPlugin::ajaxLookup(); }));
++        $dispatcher->append(url('^/ticket2task/(?P<tid>\d+)$',
++            function($tid) { TicketToTaskPlugin::ajaxDialog($tid); }));
++    }
++
++    /** Target ticket preview: ?number=123456&from=<source id> */
++    static function ajaxLookup() {
++        global $thisstaff;
++        if (!$thisstaff)
++            Http::response(403, 'Login required');
++        $out = array('ok' => false);
++        $num = trim((string) @$_GET['number']);
++        if ($num !== '' && ($t = Ticket::lookupByNumber($num))) {
++            if ((int) $t->getId() === (int) @$_GET['from'])
++                $out['error'] = __('That is this ticket.');
++            elseif (!$t->checkStaffPerm($thisstaff, Task::PERM_CREATE))
++                $out['error'] = __('You cannot add tasks to that ticket.');
++            else
++                $out = array('ok' => true,
++                    'subject' => Format::truncate($t->getSubject(), 60),
++                    'dept_id' => $t->getDeptId(),
++                    'status' => $t->getStatus()->getName());
++        } elseif ($num !== '') {
++            $out['error'] = __('No ticket with that number.');
++        }
++        Http::response(200, JsonDataEncoder::encode($out), 'application/json');
++    }
++
++    static function ajaxDialog($tid) {
++        global $thisstaff;
++
++        if (!$thisstaff)
++            Http::response(403, 'Login required');
++        if (!($ticket = Ticket::lookup((int) $tid)) || !$ticket->checkStaffPerm($thisstaff))
++            Http::response(404, 'No such ticket');
++        if (!self::canConvert($ticket))
++            Http::response(403, 'Permission denied');
++
++        $canClose = $ticket->checkStaffPerm($thisstaff, Ticket::PERM_CLOSE);
++        $canDelete = self::$opts['allow_delete']
++            && $ticket->checkStaffPerm($thisstaff, Ticket::PERM_DELETE);
++        $closedStatuses = array();
++        foreach (TicketStatusList::getStatuses(array('states' => array('closed'))) as $s)
++            if ($s->isEnabled())
++                $closedStatuses[$s->getId()] = $s->getName();
++
++        $info = $errors = array();
++        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
++            $info = $_POST;
++            if ($task = self::convert($ticket, $_POST, $errors, $canClose, $canDelete,
++                    array_keys($closedStatuses))) {
++                // Plain-text JSON: the dialog code parses it and follows "redirect"
++                Http::response(200, JsonDataEncoder::encode(array(
++                    'redirect' => 'tasks.php?id=' . $task->getId())));
++            }
++        } else {
++            $info = array(
++                'title' => $ticket->getSubject(),
++                'original' => $canClose ? 'close' : 'delete',
++            );
++            // Default to a status literally called "Closed", else the first
++            foreach ($closedStatuses as $id => $name)
++                if (!isset($info['status_id']) || !strcasecmp($name, 'Closed'))
++                    $info['status_id'] = $id;
++        }
++        include __DIR__ . '/dialog.tmpl.php';
++    }
++
++    /* ---------------------------------------------------------------
++     * Conversion
++     * ------------------------------------------------------------- */
++
++    static function convert($source, $vars, &$errors, $canClose, $canDelete, $closedIds) {
++        global $thisstaff, $ost;
++
++        // ---- validate
++        $num = trim((string) @$vars['target']);
++        $target = $num !== '' ? Ticket::lookupByNumber($num) : null;
++        if (!$target)
++            $errors['target'] = __('Enter a valid ticket number.');
++        elseif ($target->getId() == $source->getId())
++            $errors['target'] = __('Choose a different ticket.');
++        elseif (!$target->checkStaffPerm($thisstaff, Task::PERM_CREATE))
++            $errors['target'] = __('You cannot add tasks to that ticket.');
++
++        $title = trim((string) @$vars['title']);
++        if ($title === '')
++            $errors['title'] = __('Title is required.');
++
++        $dept = (int) @$vars['dept_id'] ? Dept::lookup((int) $vars['dept_id'])
++            : ($target ? $target->getDept() : null);
++        if (!$dept && !isset($errors['target']))
++            $errors['dept_id'] = __('Department is required.');
++
++        $original = @$vars['original'];
++        if ($original === 'delete' && !$canDelete)
++            $errors['original'] = __('You cannot delete this ticket.');
++        elseif ($original === 'close' && !$canClose)
++            $errors['original'] = __('You cannot close this ticket.');
++        elseif (!in_array($original, array('close', 'delete')))
++            $errors['original'] = __('Choose what happens to this ticket.');
++        if ($original === 'close' && !in_array((int) @$vars['status_id'], $closedIds))
++            $errors['status_id'] = __('Choose a closed status.');
++
++        if ($errors) {
++            $errors['err'] = __('Correct the errors below and try again.');
++            return false;
++        }
++
++        $srcThread = $source->getThread();
++        $srcNumber = $source->getNumber();
++        $srcLink = sprintf('<a href="tickets.php?id=%d"><b>#%s</b></a>',
++            $source->getId(), $srcNumber);
++
++        // ---- 1. create the task
++        $assignee = $source->getStaff() ?: null;
++        $user = $source->getOwner();
++        $desc = sprintf('<p>%s</p><p>%s: %s<br>%s: %s<br>%s: %s</p>',
++            sprintf(__('Converted from ticket %s by %s.'),
++                $original === 'delete' ? '#' . $srcNumber : $srcLink,
++                Format::htmlchars($thisstaff->getName())),
++            __('Subject'), Format::htmlchars($source->getSubject()),
++            __('Customer'), Format::htmlchars($user ? sprintf('%s (%s)',
++                $user->getName(), $user->getEmail()) : ''),
++            __('Created'), Format::datetime($source->getCreateDate()));
++        $tvars = array(
++            'object_id' => $target->getId(),
++            'object_type' => ObjectModel::OBJECT_TYPE_TICKET,
++            'default_formdata' => array('title' => $title, 'description' => $desc),
++            'internal_formdata' => array('dept_id' => $dept->getId(),
++                'assignee' => $assignee),
++            'description' => $desc,
++            'staffId' => $thisstaff->getId(),
++            'poster' => $thisstaff,
++            'ip_address' => $_SERVER['REMOTE_ADDR'],
++        );
++        if (!($task = Task::create($tvars, $errors))) {
++            $errors['err'] = $errors['err'] ?: __('Unable to create the task.');
++            return false;
++        }
++
++        // ---- 2. copy the thread
++        $map = self::copyThread($srcThread->getId(), $task->getThread()->getId());
++
++        // ---- 3. customer + collaborators -> target ticket
++        $e = array();
++        $people = array();
++        if ($user)
++            $people[] = $user;
++        foreach ($source->getCollaborators() as $c)
++            if ($u = $c->getUser())
++                $people[] = $u;
++        foreach ($people as $u) {
++            if ($u->getId() == $target->getOwnerId())
++                continue;
++            $target->addCollaborator($u, array(), $e);
++        }
++
++        // ---- 4. move the original's tasks
++        foreach (Task::objects()->filter(array(
++                'object_id' => $source->getId(),
++                'object_type' => ObjectModel::OBJECT_TYPE_TICKET)) as $t) {
++            $t->object_id = $target->getId();
++            $t->save();
++        }
++
++        // ---- 5. Time & Cost entries
++        self::moveTimeEntries($source->getId(), $task->getId(), $target->getId(), $map);
++
++        // ---- 6. notes, then close / delete the original
++        $taskLink = sprintf('<a href="tasks.php?id=%d"><b>#%s</b></a>',
++            $task->getId(), $task->getNumber());
++        $targetLink = sprintf('<a href="tickets.php?id=%d"><b>#%s</b></a>',
++            $target->getId(), $target->getNumber());
++        $target->logNote(__('Task created from ticket'),
++            sprintf(__('Ticket %s (%s) was converted to task %s by %s.'),
++                $original === 'delete' ? '#' . $srcNumber : $srcLink,
++                Format::htmlchars($source->getSubject()), $taskLink,
++                Format::htmlchars($thisstaff->getName())),
++            $thisstaff, false);
++
++        if ($original === 'delete') {
++            $source->delete(sprintf(__('Converted to task #%s on ticket #%s'),
++                $task->getNumber(), $target->getNumber()));
++        } else {
++            $source->logNote(__('Converted to task'),
++                sprintf(__('This ticket was converted to task %s on ticket %s by %s.'),
++                    $taskLink, $targetLink, Format::htmlchars($thisstaff->getName())),
++                $thisstaff, false);
++            $e = array();
++            $status = TicketStatus::lookup((int) $vars['status_id']);
++            if (!$source->isClosed() || $source->getStatusId() != $status->getId())
++                $source->setStatus($status, '', $e, true, true);
++            if ($e)
++                $ost->logWarning('Convert Ticket to Task', sprintf(
++                    'Task #%s created, but ticket #%s could not be closed: %s',
++                    $task->getNumber(), $srcNumber, implode('; ', $e)), false);
++        }
++        return $task;
++    }
++
++    /**
++     * Copy all messages, replies and notes (not system events) from one
++     * thread to another, keeping author, dates and attachments.
++     * Returns array(old entry id => new entry id).
++     */
++    static function copyThread($fromThreadId, $toThreadId) {
++        $P = TABLE_PREFIX;
++        $map = array();
++        $cols = 'staff_id, user_id, type, poster, editor, editor_type, source,
++                 title, body, format, ip_address, extra, recipients, created, updated';
++        $res = db_query(sprintf(
++            "SELECT id, pid, flags FROM `{$P}thread_entry`
++             WHERE thread_id=%d AND type IN ('M','R','N') ORDER BY created, id",
++            $fromThreadId));
++        $rows = array();
++        while ($res && ($r = db_fetch_array($res)))
++            $rows[] = array_map('intval', $r);
++
++        foreach ($rows as $r) {
++            $old = $r['id'];
++            // Not the original message of the task (the task description is)
++            $newFlags = $r['flags'] & ~ThreadEntry::FLAG_ORIGINAL_MESSAGE;
++            if (!db_query(sprintf(
++                "INSERT INTO `{$P}thread_entry` (thread_id, pid, flags, $cols)
++                 SELECT %d, 0, %d, $cols FROM `{$P}thread_entry` WHERE id=%d",
++                $toThreadId, $newFlags, $old)))
++                continue;
++            $new = (int) db_insert_id();
++            $map[$old] = $new;
++
++            db_query(sprintf(
++                "INSERT INTO `{$P}attachment` (object_id, type, file_id, name, inline, lang)
++                 SELECT %d, type, file_id, name, inline, lang FROM `{$P}attachment`
++                 WHERE object_id=%d AND type='H'", $new, $old));
++            db_query(sprintf(
++                "INSERT IGNORE INTO `{$P}_search` (object_type, object_id, title, content)
++                 SELECT 'H', %d, title, content FROM `{$P}_search`
++                 WHERE object_type='H' AND object_id=%d", $new, $old));
++        }
++        // Keep reply-to links between copied entries
++        foreach ($rows as $r)
++            if ($r['pid'] && isset($map[$r['id']], $map[$r['pid']]))
++                db_query(sprintf("UPDATE `{$P}thread_entry` SET pid=%d WHERE id=%d",
++                    $map[$r['pid']], $map[$r['id']]));
++        return $map;
++    }
++
++    /** Re-attribute Time & Cost rows of the ticket to the new task. */
++    static function moveTimeEntries($srcTicketId, $taskId, $targetId, $map) {
++        if (!class_exists('TimeTrackingPlugin') || !TimeTrackingPlugin::$opts)
++            return;
++        if (!TimeTrackingPlugin::ensureSchema())
++            return;
++        $T = TimeTrackingPlugin::table();
++
++        // Keep any hand-entered value on the target ticket before rows arrive
++        TimeTrackingPlugin::seedOpening('T', $targetId, $targetId);
++
++        foreach ($map as $old => $new)
++            db_query(sprintf("UPDATE `%s` SET thread_entry_id=%d
++                WHERE object_type='T' AND object_id=%d AND thread_entry_id=%d",
++                $T, $new, $srcTicketId, $old));
++        // Hand-entered value on the original ticket becomes the task's opening row
++        TimeTrackingPlugin::seedOpening('T', $srcTicketId, $srcTicketId);
++        db_query(sprintf("UPDATE `%s` SET object_type='A', object_id=%d, ticket_id=%d
++            WHERE object_type='T' AND object_id=%d", $T, $taskId, $targetId, $srcTicketId));
++        // The original's existing tasks moved to the target ticket too
++        db_query(sprintf("UPDATE `%s` SET ticket_id=%d
++            WHERE object_type='A' AND ticket_id=%d", $T, $targetId, $srcTicketId));
++
++        TimeTrackingPlugin::updateTotals('A', $taskId);
++        TimeTrackingPlugin::updateTotals('T', $targetId);
++        TimeTrackingPlugin::updateTotals('T', $srcTicketId);
++    }
++}
+diff --git a/include/plugins/ticket-to-task/dialog.tmpl.php b/include/plugins/ticket-to-task/dialog.tmpl.php
+new file mode 100644
+index 0000000..2b1bc92
+--- /dev/null
++++ b/include/plugins/ticket-to-task/dialog.tmpl.php
+@@ -0,0 +1,122 @@
++<?php
++// Convert to Task dialog. Variables from TicketToTaskPlugin::ajaxDialog():
++// $ticket, $info, $errors, $canClose, $canDelete, $closedStatuses
++$h = function($v) { return Format::htmlchars($v); };
++$depts = Dept::getDepartments(array('activeonly' => true));
++$owner = $ticket->getOwner();
++$ncollab = count($ticket->getCollaborators());
++?>
++<h3 class="drag-handle"><?php echo __('Convert to Task'); ?></h3>
++<b><a class="close" href="#"><i class="icon-remove-circle"></i></a></b>
++<div class="clear"></div>
++<hr/>
++<?php if ($errors['err']) { ?>
++<p id="msg_error"><?php echo $h($errors['err']); ?></p>
++<?php } else { ?>
++<p id="msg_info"><i class="icon-info-sign"></i> <?php echo sprintf(
++    __('Ticket #%s and its whole thread (messages, replies, notes and attachments) will be copied into a new task on another ticket.'),
++    $h($ticket->getNumber())); ?></p>
++<?php } ?>
++<form method="post" action="#ticket2task/<?php echo $ticket->getId(); ?>" id="ticket2task">
++  <?php csrf_token(); ?>
++  <table width="100%" class="form_table" style="border-spacing:0 6px">
++    <tr>
++      <td width="160"><strong><?php echo __('Target ticket number'); ?>:</strong></td>
++      <td>
++        <input type="text" name="target" id="t2t-target" size="14" autocomplete="off"
++          autofocus value="<?php echo $h($info['target']); ?>">
++        <span class="error">*&nbsp;<?php echo $h($errors['target']); ?></span>
++        <div id="t2t-preview" class="faded" style="margin-top:3px"></div>
++      </td>
++    </tr>
++    <tr>
++      <td><strong><?php echo __('Task title'); ?>:</strong></td>
++      <td>
++        <input type="text" name="title" size="50" style="width:95%"
++          value="<?php echo $h($info['title']); ?>">
++        <span class="error">*&nbsp;<?php echo $h($errors['title']); ?></span>
++      </td>
++    </tr>
++    <tr>
++      <td><strong><?php echo __('Department'); ?>:</strong></td>
++      <td>
++        <select name="dept_id" id="t2t-dept">
++          <option value="">&mdash; <?php echo __('Same as target ticket'); ?> &mdash;</option>
++          <?php foreach ($depts as $id => $name) { ?>
++          <option value="<?php echo (int) $id; ?>" <?php
++            if ((int) $info['dept_id'] === (int) $id) echo 'selected="selected"';
++            ?>><?php echo $h($name); ?></option>
++          <?php } ?>
++        </select>
++        <span class="error">*&nbsp;<?php echo $h($errors['dept_id']); ?></span>
++      </td>
++    </tr>
++    <tr>
++      <td><strong><?php echo __('Assigned to'); ?>:</strong></td>
++      <td><?php echo ($s = $ticket->getStaff())
++          ? $h($s->getName()) . ' <span class="faded">(' . __('same as this ticket') . ')</span>'
++          : '<span class="faded">' . __('Unassigned') . '</span>'; ?></td>
++    </tr>
++    <tr>
++      <td style="vertical-align:top"><strong><?php echo __('This ticket'); ?>:</strong></td>
++      <td>
++        <?php if ($canClose) { ?>
++        <label><input type="radio" name="original" value="close" <?php
++          if ($info['original'] !== 'delete') echo 'checked="checked"'; ?>>
++          <?php echo __('Close it with status'); ?></label>
++        <select name="status_id">
++          <?php foreach ($closedStatuses as $id => $name) { ?>
++          <option value="<?php echo (int) $id; ?>" <?php
++            if ((int) $info['status_id'] === (int) $id) echo 'selected="selected"';
++            ?>><?php echo $h($name); ?></option>
++          <?php } ?>
++        </select>
++        <span class="faded"><?php echo __('and a note linking to the task'); ?></span>
++        <span class="error"><?php echo $h($errors['status_id']); ?></span>
++        <br>
++        <?php }
++        if ($canDelete) { ?>
++        <label><input type="radio" name="original" value="delete" <?php
++          if ($info['original'] === 'delete' || !$canClose) echo 'checked="checked"'; ?>>
++          <?php echo __('Delete it'); ?></label>
++          <span class="faded"><?php echo __('(the task keeps the copied thread)'); ?></span>
++        <?php } ?>
++        <div class="error"><?php echo $h($errors['original']); ?></div>
++      </td>
++    </tr>
++  </table>
++  <p class="faded" style="margin:6px 0 0">
++    <i class="icon-group"></i> <?php echo sprintf(
++      __('The customer (%s) and %d collaborator(s) will be added to the target ticket. Tasks of this ticket move to the target ticket; logged Time & Cost moves to the new task.'),
++      $h($owner ? $owner->getName() . ' <' . $owner->getEmail() . '>' : ''), $ncollab); ?>
++  </p>
++  <hr>
++  <p class="full-width">
++    <span class="buttons pull-left">
++      <input type="button" name="cancel" class="close" value="<?php echo __('Cancel'); ?>">
++    </span>
++    <span class="buttons pull-right">
++      <input type="submit" value="<?php echo __('Convert'); ?>">
++    </span>
++  </p>
++</form>
++<div class="clear"></div>
++<script type="text/javascript">
++(function($) {
++  var timer, from = <?php echo (int) $ticket->getId(); ?>;
++  function lookup() {
++    var num = $.trim($('#t2t-target').val()), $p = $('#t2t-preview');
++    if (!num) { $p.text(''); return; }
++    $.getJSON('ajax.php/ticket2task/lookup', {number: num, from: from}, function(r) {
++      if (r.ok) {
++        $p.removeClass('error').text(r.subject + ' — ' + r.status);
++        if (!$('#t2t-dept').val()) $('#t2t-dept').val(String(r.dept_id));
++      } else {
++        $p.addClass('error').text(r.error || '');
++      }
++    });
++  }
++  $('#t2t-target').on('input', function() { clearTimeout(timer); timer = setTimeout(lookup, 300); });
++  if ($('#t2t-target').val()) lookup();
++})(jQuery);
++</script>
+diff --git a/include/plugins/ticket-to-task/plugin.php b/include/plugins/ticket-to-task/plugin.php
+new file mode 100644
+index 0000000..b9a299c
+--- /dev/null
++++ b/include/plugins/ticket-to-task/plugin.php
+@@ -0,0 +1,14 @@
++<?php
++
++return array(
++    'id' =>             'community:ticket-to-task', # notrans
++    'version' =>        '1.0.0',
++    'ost_version' =>    '1.17',
++    'name' =>           /* trans */ 'Convert Ticket to Task',
++    'author' =>         'Community contributors',
++    'description' =>    /* trans */ 'Adds "Convert to Task" to the ticket More
++        menu. The ticket\'s whole thread is copied into a new task on another
++        ticket, its customer is added to that ticket, and the original ticket
++        is closed or deleted.',
++    'plugin' =>         'convert.php:TicketToTaskPlugin',
++);
+diff --git a/include/plugins/time-tracking/config.php b/include/plugins/time-tracking/config.php
+new file mode 100644
+index 0000000..3a2ab1f
+--- /dev/null
++++ b/include/plugins/time-tracking/config.php
+@@ -0,0 +1,92 @@
++<?php
++require_once INCLUDE_DIR . 'class.plugin.php';
++require_once INCLUDE_DIR . 'class.forms.php';
++
++class TimeTrackingConfig extends PluginConfig {
++
++    function getOptions() {
++        return array(
++            'fields' => new SectionBreakField(array(
++                'label' => 'Ticket form fields',
++                'hint' => 'Enter the "Variable" name of the Time and Cost
++                    fields on your ticket form (Admin Panel > Manage > Forms).
++                    These fields hold the running totals, including time
++                    logged on the ticket\'s tasks.',
++            )),
++            'time_field' => new TextboxField(array(
++                'label' => 'Time field variable',
++                'default' => 'time',
++                'required' => true,
++                'configuration' => array('size' => 30, 'length' => 64),
++            )),
++            'cost_field' => new TextboxField(array(
++                'label' => 'Cost field variable',
++                'default' => 'cost',
++                'required' => true,
++                'configuration' => array('size' => 30, 'length' => 64),
++            )),
++            'task_fields' => new SectionBreakField(array(
++                'label' => 'Task form fields',
++                'hint' => 'Variable names of the Time and Cost fields on your
++                    task form (e.g. "Task Details"). Task entries also roll up
++                    into the parent ticket\'s totals.',
++            )),
++            'task_time_field' => new TextboxField(array(
++                'label' => 'Task time field variable',
++                'default' => 'time',
++                'required' => true,
++                'configuration' => array('size' => 30, 'length' => 64),
++            )),
++            'task_cost_field' => new TextboxField(array(
++                'label' => 'Task cost field variable',
++                'default' => 'cost',
++                'required' => true,
++                'configuration' => array('size' => 30, 'length' => 64),
++            )),
++            'display' => new SectionBreakField(array(
++                'label' => 'Display',
++            )),
++            'time_format' => new ChoiceField(array(
++                'label' => 'Time total format',
++                'default' => 'decimal',
++                'required' => true,
++                'choices' => array(
++                    'decimal' => 'Decimal hours (e.g. 1.50)',
++                    'hm'      => 'Hours:minutes (e.g. 1:30)',
++                ),
++            )),
++            'currency' => new TextboxField(array(
++                'label' => 'Currency symbol',
++                'default' => '$',
++                'hint' => 'Used for display on thread entries only; the
++                    Cost field total is stored as a plain number.',
++                'configuration' => array('size' => 5, 'length' => 8),
++            )),
++            'timer_section' => new SectionBreakField(array(
++                'label' => 'Timer',
++            )),
++            'timer' => new BooleanField(array(
++                'label' => 'Count-up timer',
++                'default' => true,
++                'configuration' => array(
++                    'desc' => 'Run a timer in the Time box from when the ticket
++                        or task is opened; its time is filled in when posting',
++                ),
++            )),
++            'timer_round' => new ChoiceField(array(
++                'label' => 'Round timer up to',
++                'default' => '6',
++                'required' => true,
++                'hint' => 'Applies to timed entries only; times typed in by
++                    hand are kept as entered.',
++                'choices' => array(
++                    '1'  => 'Next minute',
++                    '6'  => 'Next 0.1 hour (6 minutes)',
++                    '15' => 'Next 0.25 hour (15 minutes)',
++                    '30' => 'Next 0.5 hour (30 minutes)',
++                    '60' => 'Next hour',
++                ),
++            )),
++        );
++    }
++}
+diff --git a/include/plugins/time-tracking/plugin.php b/include/plugins/time-tracking/plugin.php
+new file mode 100644
+index 0000000..463dbf9
+--- /dev/null
++++ b/include/plugins/time-tracking/plugin.php
+@@ -0,0 +1,14 @@
++<?php
++
++return array(
++    'id' =>             'community:time-tracking', # notrans
++    'version' =>        '1.3.0',
++    'ost_version' =>    '1.17',
++    'name' =>           /* trans */ 'Time & Cost Tracking',
++    'author' =>         'Community contributors',
++    'description' =>    /* trans */ 'Adds Time and Cost inputs to ticket and task
++        replies/updates and internal notes. Each post logs an entry; ticket and
++        task Time / Cost custom fields are kept as running totals, with task
++        time rolling up into the parent ticket.',
++    'plugin' =>         'timetracking.php:TimeTrackingPlugin',
++);
+diff --git a/include/plugins/time-tracking/timetracking.php b/include/plugins/time-tracking/timetracking.php
+new file mode 100644
+index 0000000..3ce6f7b
+--- /dev/null
++++ b/include/plugins/time-tracking/timetracking.php
+@@ -0,0 +1,454 @@
++<?php
++/*********************************************************************
++ * Time & Cost Tracking plugin for osTicket 1.17 / 1.18
++ *
++ * - Adds "Time" and "Cost" inputs to the staff Post Reply / Post
++ *   Internal Note forms on tickets, and Post Update / Post Internal
++ *   Note on tasks (standalone or opened inside a ticket).
++ * - Every post with a value logs a row in %TABLE_PREFIX%time_cost_entry.
++ * - Ticket Time / Cost fields = ticket's own entries + all of its tasks.
++ *   Task Time / Cost fields = that task's own entries.
++ * - Each thread entry with logged time/cost shows a small badge.
++ *
++ * Totals are always recomputed from the log, so concurrent posts can't
++ * drift. Any value already in a ticket's or task's Time/Cost field the
++ * first time an entry is logged on it is imported as an "opening" row.
++ *********************************************************************/
++
++require_once INCLUDE_DIR . 'class.plugin.php';
++require_once INCLUDE_DIR . 'class.signal.php';
++require_once __DIR__ . '/config.php';
++
++class TimeTrackingPlugin extends Plugin {
++    var $config_class = 'TimeTrackingConfig';
++
++    // Instance settings captured at bootstrap (PluginManager clears the
++    // side-loaded config right after bootstrap()).
++    static $opts = null;
++    static $handled = false;
++    static $posted = array();   // "T:12" => true when a post succeeded this request
++    static $schemaOk = false;
++
++    function isMultiInstance() {
++        return false;
++    }
++
++    function bootstrap() {
++        $c = $this->getConfig();
++        $fmt = $c->get('time_format');
++        if (is_array($fmt))
++            $fmt = key($fmt);
++
++        $round = $c->get('timer_round');
++        if (is_array($round))
++            $round = key($round);
++        $round = (int) $round;
++        if (!in_array($round, array(1, 6, 15, 30, 60)))
++            $round = 6;
++
++        self::$opts = array(
++            'time_field' => mb_strtolower(trim($c->get('time_field') ?: 'time')),
++            'cost_field' => mb_strtolower(trim($c->get('cost_field') ?: 'cost')),
++            'task_time_field' => mb_strtolower(trim($c->get('task_time_field') ?: 'time')),
++            'task_cost_field' => mb_strtolower(trim($c->get('task_cost_field') ?: 'cost')),
++            'time_format' => $fmt === 'hm' ? 'hm' : 'decimal',
++            'currency' => (string) $c->get('currency', '$'),
++            'timer' => (bool) $c->get('timer', true),
++            'timer_round' => $round,
++        );
++
++        Signal::connect('threadentry.created', array(__CLASS__, 'onEntryCreated'));
++        Signal::connect('object.view', array(__CLASS__, 'onObjectView'), 'Ticket');
++        Signal::connect('object.view', array(__CLASS__, 'onObjectView'), 'Task');
++        Signal::connect('model.deleted', array(__CLASS__, 'onObjectDeleted'), 'Task');
++        Signal::connect('model.deleted', array(__CLASS__, 'onObjectDeleted'), 'Ticket');
++        Signal::connect('ajax.scp', function($dispatcher) {
++            $dispatcher->append(url_get('^/timetracking/ticket/(?P<id>\d+)/summary$',
++                function($id) { TimeTrackingPlugin::ajaxSummary($id); }));
++        });
++    }
++
++    /* ---------------------------------------------------------------
++     * Parsing / formatting
++     * ------------------------------------------------------------- */
++
++    /**
++     * Accepts "1.5", "1,5", "1:30", "1h30m", "1h 30m", "90m", "2h", "-0.25".
++     * Returns signed minutes (int), null for empty input, false if invalid.
++     */
++    static function parseTime($input) {
++        $s = strtolower(trim((string) $input));
++        if ($s === '')
++            return null;
++        $sign = 1;
++        if ($s[0] === '-') { $sign = -1; $s = ltrim(substr($s, 1)); }
++        elseif ($s[0] === '+') { $s = ltrim(substr($s, 1)); }
++        $s = str_replace(',', '.', $s);
++
++        if (preg_match('/^(\d+):([0-5]?\d)$/', $s, $m))
++            $min = $m[1] * 60 + $m[2];
++        elseif (preg_match('/^(?:(\d+(?:\.\d+)?)\s*h(?:rs?|ours?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?)?)?)?$/', $s, $m)
++                && (@$m[1] !== '' || @$m[2] !== '') && $s !== '')
++            $min = round(((float) @$m[1]) * 60) + (int) @$m[2];
++        elseif (preg_match('/^\d+(?:\.\d+)?$/', $s))
++            $min = round(((float) $s) * 60);   // bare number = hours
++        else
++            return false;
++
++        return $sign * (int) $min;
++    }
++
++    /**
++     * Accepts "75", "75.50", "$1,250.00", "-20". Returns signed float
++     * rounded to cents, null for empty input, false if invalid.
++     */
++    static function parseCost($input) {
++        $s = trim((string) $input);
++        if ($s === '')
++            return null;
++        $s = preg_replace('/[\s$€£¥,]/u', '', $s);
++        if (!preg_match('/^[-+]?\d+(?:\.\d{1,2})?$/', $s))
++            return false;
++        return round((float) $s, 2);
++    }
++
++    static function formatTime($minutes) {
++        $minutes = (int) $minutes;
++        if (self::$opts['time_format'] === 'hm') {
++            $sign = $minutes < 0 ? '-' : '';
++            $minutes = abs($minutes);
++            return sprintf('%s%d:%02d', $sign, intdiv($minutes, 60), $minutes % 60);
++        }
++        return sprintf('%.2f', $minutes / 60);
++    }
++
++    static function formatCost($cost) {
++        return sprintf('%.2f', $cost);
++    }
++
++    /* ---------------------------------------------------------------
++     * Storage
++     *
++     * object_type/object_id: what the time was logged on ('T' ticket or
++     * 'A' task). ticket_id: the ticket the row rolls up into (the ticket
++     * itself, the task's parent ticket, or 0 for a standalone task).
++     * ------------------------------------------------------------- */
++
++    static function table() {
++        return TABLE_PREFIX . 'time_cost_entry';
++    }
++
++    static function ensureSchema() {
++        if (self::$schemaOk)
++            return true;
++        $sql = 'CREATE TABLE IF NOT EXISTS `' . self::table() . '` (
++              `id` int(11) unsigned NOT NULL auto_increment,
++              `object_type` char(1) NOT NULL default \'T\',
++              `object_id` int(11) unsigned NOT NULL,
++              `ticket_id` int(11) unsigned NOT NULL default 0,
++              `thread_entry_id` int(11) unsigned NOT NULL default 0,
++              `staff_id` int(11) unsigned NOT NULL default 0,
++              `kind` varchar(16) NOT NULL default \'entry\',
++              `minutes` int(11) NOT NULL default 0,
++              `cost` decimal(12,2) NOT NULL default 0,
++              `created` datetime NOT NULL,
++              PRIMARY KEY (`id`),
++              KEY `object` (`object_type`, `object_id`),
++              KEY `ticket_id` (`ticket_id`),
++              KEY `thread_entry_id` (`thread_entry_id`)
++            ) DEFAULT CHARSET=utf8';
++        return self::$schemaOk = (bool) db_query($sql);
++    }
++
++    static function insertRow($type, $objId, $ticketId, $entryId, $staffId,
++            $kind, $minutes, $cost) {
++        return db_query(sprintf(
++            'INSERT INTO `%s` (object_type, object_id, ticket_id, thread_entry_id,
++                staff_id, kind, minutes, cost, created)
++             VALUES (%s, %d, %d, %d, %d, %s, %d, %s, NOW())',
++            self::table(), db_input($type), $objId, $ticketId, $entryId,
++            $staffId, db_input($kind), $minutes, db_input(sprintf('%.2f', $cost))));
++    }
++
++    static function objectHasRows($type, $objId) {
++        $res = db_query(sprintf(
++            'SELECT 1 FROM `%s` WHERE object_type=%s AND object_id=%d LIMIT 1',
++            self::table(), db_input($type), $objId));
++        return $res && db_num_rows($res) > 0;
++    }
++
++    /** Ticket: own rows + rows of its tasks. Task: own rows only. */
++    static function totals($type, $objId) {
++        $where = $type === 'T'
++            ? sprintf('ticket_id=%d', $objId)
++            : sprintf("object_type='A' AND object_id=%d", $objId);
++        $res = db_query(sprintf(
++            'SELECT COALESCE(SUM(minutes),0) AS minutes, COALESCE(SUM(cost),0) AS cost
++             FROM `%s` WHERE %s', self::table(), $where));
++        $row = $res ? db_fetch_array($res) : null;
++        return array((int) @$row['minutes'], (float) @$row['cost']);
++    }
++
++    /* ---------------------------------------------------------------
++     * Custom-field access (ticket or task forms)
++     * ------------------------------------------------------------- */
++
++    static function fieldNames($type) {
++        $o = self::$opts;
++        return $type === 'A'
++            ? array($o['task_time_field'], $o['task_cost_field'])
++            : array($o['time_field'], $o['cost_field']);
++    }
++
++    /** Find (or create) the answer object for a field by variable name. */
++    static function getAnswer($type, $objId, $name) {
++        foreach (DynamicFormEntry::forObject($objId, $type) as $entry) {
++            if ($a = $entry->getAnswer($name))
++                return $a;
++            // Field is on this form but has never been answered
++            foreach ($entry->getFields() as $f) {
++                if (mb_strtolower($f->get('name')) == $name) {
++                    $entry->addMissingFields();
++                    return $entry->getAnswer($f->get('name'));
++                }
++            }
++        }
++        return null;
++    }
++
++    static function setAnswer($type, $objId, $name, $value) {
++        if (!($a = self::getAnswer($type, $objId, $name)))
++            return false;
++        if ((string) $a->get('value') === (string) $value)
++            return true;
++        $a->setValue($value);
++        return $a->save();   // fires model.updated -> refreshes __cdata tables
++    }
++
++    /** First row for an object: import any hand-entered field values. */
++    static function seedOpening($type, $objId, $ticketId) {
++        if (self::objectHasRows($type, $objId))
++            return;
++        list($tf, $cf) = self::fieldNames($type);
++        $min = ($a = self::getAnswer($type, $objId, $tf))
++            ? self::parseTime($a->get('value')) : null;
++        $cost = ($a = self::getAnswer($type, $objId, $cf))
++            ? self::parseCost($a->get('value')) : null;
++        if ($min || $cost)
++            self::insertRow($type, $objId, $ticketId, 0, 0, 'opening',
++                (int) $min, (float) $cost);
++    }
++
++    static function updateTotals($type, $objId) {
++        list($tf, $cf) = self::fieldNames($type);
++        list($min, $cost) = self::totals($type, $objId);
++        self::setAnswer($type, $objId, $tf, self::formatTime($min));
++        self::setAnswer($type, $objId, $cf, self::formatCost($cost));
++    }
++
++    /** Parent ticket id of a task (0 if standalone). */
++    static function taskTicketId($task) {
++        return ($task->object_type === 'T') ? (int) $task->object_id : 0;
++    }
++
++    /* ---------------------------------------------------------------
++     * Signal handlers
++     * ------------------------------------------------------------- */
++
++    static function onEntryCreated($entry) {
++        global $thisstaff;
++
++        if (self::$handled || !self::$opts || !$thisstaff
++                || !defined('OSTSCPINC') || $_SERVER['REQUEST_METHOD'] !== 'POST')
++            return;
++        if (!($thread = $entry->getThread()) || !($obj = $thread->getObject()))
++            return;
++
++        // Only the staff Post Reply / Update and Post Internal Note actions
++        $type = $thread->getObjectType();
++        $actions = array(
++            'T' => array('reply' => 'R', 'postnote' => 'N'),
++            'A' => array('postreply' => 'R', 'postnote' => 'N'),
++        );
++        $action = @$_POST['a'];
++        if (!isset($actions[$type][$action]) || $entry->type !== $actions[$type][$action])
++            return;
++        // The post went through: don't re-fill the inputs on the redisplayed form
++        self::$posted[$type . ':' . $obj->getId()] = true;
++
++        $minutes = self::parseTime(@$_POST['tt_time']);
++        $cost = self::parseCost(@$_POST['tt_cost']);
++        if ($minutes === false || $cost === false) {
++            global $ost;
++            $ost->logWarning('Time & Cost Tracking',
++                sprintf('Ignored invalid time/cost (%s / %s) on %s #%s',
++                    @$_POST['tt_time'], @$_POST['tt_cost'],
++                    $type === 'A' ? 'task' : 'ticket', $obj->getNumber()), false);
++            $minutes = $minutes === false ? null : $minutes;
++            $cost = $cost === false ? null : $cost;
++        }
++        if (!$minutes && !$cost)
++            return;
++
++        self::$handled = true;
++        if (!self::ensureSchema())
++            return;
++
++        $objId = $obj->getId();
++        $ticketId = $type === 'T' ? $objId : self::taskTicketId($obj);
++
++        // Import hand-entered values before the first logged row, for the
++        // object itself and (for a task) its parent ticket.
++        self::seedOpening($type, $objId, $ticketId);
++        if ($type === 'A' && $ticketId)
++            self::seedOpening('T', $ticketId, $ticketId);
++
++        self::insertRow($type, $objId, $ticketId, $entry->getId(),
++            $thisstaff->getId(), 'entry', (int) $minutes, (float) $cost);
++
++        self::updateTotals($type, $objId);
++        if ($type === 'A' && $ticketId)
++            self::updateTotals('T', $ticketId);
++    }
++
++    /** Remove a deleted task's rows and refresh its parent ticket. */
++    static function onObjectDeleted($obj, &$data=null) {
++        if (!self::$opts || !self::ensureSchema())
++            return;
++        if ($obj instanceof Task) {
++            $id = (int) $obj->getId();
++            db_query(sprintf("DELETE FROM `%s` WHERE object_type='A' AND object_id=%d",
++                self::table(), $id));
++            if ($tid = self::taskTicketId($obj))
++                self::updateTotals('T', $tid);
++        } elseif ($obj instanceof Ticket) {
++            // Tasks of a deleted ticket are deleted separately; drop the
++            // ticket's own rows and detach anything still pointing at it.
++            $id = (int) $obj->getId();
++            db_query(sprintf("DELETE FROM `%s` WHERE object_type='T' AND object_id=%d",
++                self::table(), $id));
++            db_query(sprintf('UPDATE `%s` SET ticket_id=0 WHERE ticket_id=%d',
++                self::table(), $id));
++        }
++    }
++
++    /* ---------------------------------------------------------------
++     * Ticket breakdown (ticket's own time + each task)
++     * ------------------------------------------------------------- */
++
++    static function fmtPair($min, $cost) {
++        $c = (float) $cost;
++        return array(
++            'time' => self::formatTime($min)
++                . (self::$opts['time_format'] === 'decimal' ? ' h' : ''),
++            'cost' => ($c < 0 ? '-' : '') . self::$opts['currency'] . self::formatCost(abs($c)),
++        );
++    }
++
++    static function summary($ticket) {
++        $tid = (int) $ticket->getId();
++        $own = array(0, 0.0);
++        $perTask = array();
++        if (self::ensureSchema()) {
++            $res = db_query(sprintf(
++                "SELECT object_type, object_id, SUM(minutes) m, SUM(cost) c
++                 FROM `%s` WHERE ticket_id=%d GROUP BY object_type, object_id",
++                self::table(), $tid));
++            while ($res && ($r = db_fetch_array($res))) {
++                if ($r['object_type'] === 'T')
++                    $own = array((int) $r['m'], (float) $r['c']);
++                else
++                    $perTask[(int) $r['object_id']] = array((int) $r['m'], (float) $r['c']);
++            }
++        }
++        $tasks = array();
++        $sumMin = $own[0]; $sumCost = $own[1];
++        foreach (Task::objects()->filter(array(
++                'object_id' => $tid, 'object_type' => ObjectModel::OBJECT_TYPE_TICKET))
++                ->order_by('id') as $task) {
++            list($m, $c) = isset($perTask[$task->getId()]) ? $perTask[$task->getId()] : array(0, 0.0);
++            $sumMin += $m; $sumCost += $c;
++            $tasks[] = array_merge(array(
++                'id' => (int) $task->getId(),
++                'number' => $task->getNumber(),
++                'title' => (string) $task->getTitle(),
++                'status' => (string) $task->getStatus(),
++                'open' => (bool) $task->isOpen(),
++                'minutes' => $m, 'amount' => $c,
++            ), self::fmtPair($m, $c));
++        }
++        return array(
++            'ticket' => array_merge(array('minutes' => $own[0], 'amount' => $own[1]),
++                self::fmtPair($own[0], $own[1])),
++            'tasks' => $tasks,
++            'total' => array_merge(array('minutes' => $sumMin, 'amount' => $sumCost),
++                self::fmtPair($sumMin, $sumCost)),
++        );
++    }
++
++    static function ajaxSummary($id) {
++        global $thisstaff;
++        if (!$thisstaff)
++            Http::response(403, 'Login required');
++        if (!($ticket = Ticket::lookup((int) $id)) || !$ticket->checkStaffPerm($thisstaff))
++            Http::response(404, 'No such ticket');
++        Http::response(200, JsonDataEncoder::encode(self::summary($ticket)),
++            'application/json');
++    }
++
++    static function onObjectView($obj, &$data=null) {
++        global $thisstaff;
++
++        if (!self::$opts || !$thisstaff || !defined('OSTSCPINC'))
++            return;
++
++        $type = $obj instanceof Task ? 'A' : 'T';
++
++        // Per-entry badges
++        $badges = array();
++        if (self::ensureSchema()) {
++            $res = db_query(sprintf(
++                'SELECT thread_entry_id, SUM(minutes) AS minutes, SUM(cost) AS cost
++                 FROM `%s` WHERE object_type=%s AND object_id=%d AND thread_entry_id>0
++                 GROUP BY thread_entry_id',
++                self::table(), db_input($type), $obj->getId()));
++            while ($res && ($r = db_fetch_array($res))) {
++                $parts = array();
++                if ((int) $r['minutes'])
++                    $parts[] = self::formatTime($r['minutes'])
++                        . (self::$opts['time_format'] === 'decimal' ? ' h' : '');
++                if ($c = (float) $r['cost'])
++                    $parts[] = ($c < 0 ? '-' : '') . self::$opts['currency']
++                        . self::formatCost(abs($c));
++                if ($parts)
++                    $badges[(int) $r['thread_entry_id']] = implode(' · ', $parts);
++            }
++        }
++
++        // Re-fill inputs if the post failed validation and the form is
++        // redisplayed (only for the object that was posted to).
++        $posted = isset($_POST['id']) && (int) $_POST['id'] === (int) $obj->getId()
++            && empty(self::$posted[$type . ':' . $obj->getId()]);
++        $prefill = array(
++            'time' => $posted ? (string) @$_POST['tt_time'] : '',
++            'cost' => $posted ? (string) @$_POST['tt_cost'] : '',
++            'action' => $posted ? (string) @$_POST['a'] : '',
++        );
++
++        $cfg = array(
++            'scope' => $type,
++            'objId' => (int) $obj->getId(),
++            'ticketId' => $type === 'T' ? (int) $obj->getId() : null,
++            'summaryUrl' => $type === 'T'
++                ? sprintf('ajax.php/timetracking/ticket/%d/summary', $obj->getId()) : null,
++            'badges' => (object) $badges,
++            'prefill' => $prefill,
++            'unit' => self::$opts['time_format'] === 'hm' ? 'h:mm' : 'hours',
++            'currency' => self::$opts['currency'],
++            'timer' => self::$opts['timer'],
++            'roundMin' => self::$opts['timer_round'],
++        );
++        $json = json_encode($cfg, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
++        include __DIR__ . '/view.inc.php';
++    }
++}
+diff --git a/include/plugins/time-tracking/view.inc.php b/include/plugins/time-tracking/view.inc.php
+new file mode 100644
+index 0000000..cfaefe7
+--- /dev/null
++++ b/include/plugins/time-tracking/view.inc.php
+@@ -0,0 +1,292 @@
++<?php
++// Rendered at the top of the staff ticket view (object.view signal).
++// Expects $json (encoded config) from TimeTrackingPlugin::onTicketView().
++if (!defined('OSTSCPINC')) die('Access Denied');
++?>
++<style type="text/css">
++  .tt-row input.tt-time { width: 7em; }
++  .tt-row input.tt-cost { width: 8em; }
++  .tt-row .tt-hint { margin-left: 6px; }
++  .tt-row input.tt-invalid { border-color: #a00; background: #fff0f0; }
++  .tt-badge { margin-right: 4px; }
++  .tt-row input.tt-time.tt-running { color: #1a7f37; font-family: monospace; }
++  .tt-row input.tt-time.tt-paused { color: #b36b00; font-family: monospace; }
++  .tt-row a.tt-tbtn { margin-left: 7px; color: #555; text-decoration: none; }
++  .tt-row a.tt-tbtn:hover { color: #000; }
++  #tt-summary { margin: 10px 0 14px; }
++  #tt-summary h4 { margin: 0 0 4px; font-size: 1em; }
++  #tt-summary table { width: 100%; border-collapse: collapse; }
++  #tt-summary th, #tt-summary td { text-align: left; padding: 3px 8px; border-bottom: 1px solid #e5e5e5; }
++  #tt-summary .num, .tt-col { text-align: right; white-space: nowrap; }
++  #tt-summary tr.tt-total td { font-weight: bold; border-top: 2px solid #ccc; border-bottom: none; }
++</style>
++<script type="text/javascript">
++(function($) {
++  var cfg = <?php echo $json; ?>;
++
++  var timeRe = /^[-+]?\s*(\d+([.,]\d+)?|\d+:[0-5]?\d|(\d+([.,]\d+)?\s*h(rs?|ours?)?)?\s*(\d+\s*m(in(utes?)?)?)?)$/i;
++  var costRe = /^[-+]?[\s$\u20ac\u00a3\u00a5]*[\d,]*\d(\.\d{1,2})?$/;
++
++  function esc(s) { return $('<div/>').text(s).html(); }
++
++  /* ---- Count-up timer (one per ticket / task view) ---- */
++  var T = {start: Date.now(), accum: 0, running: true, iv: null};
++
++  function elapsedSec() {
++    return T.accum + (T.running ? (Date.now() - T.start) / 1000 : 0);
++  }
++  function clock(sec) {
++    sec = Math.floor(sec);
++    var h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), x = sec % 60;
++    return h + ':' + (m < 10 ? '0' : '') + m + ':' + (x < 10 ? '0' : '') + x;
++  }
++  // Round elapsed time UP to the configured step; '' when nothing elapsed
++  function roundedValue(sec) {
++    if (sec <= 0) return '';
++    var step = cfg.roundMin || 1;
++    var min = Math.ceil(sec / 60 / step - 1e-9) * step;
++    if (min <= 0) min = step;
++    if (cfg.unit === 'hours')
++      return String(parseFloat((min / 60).toFixed(2)));
++    return Math.floor(min / 60) + ':' + (min % 60 < 10 ? '0' : '') + (min % 60);
++  }
++  function timedInputs() {
++    return $('input.tt-time').filter(function() {
++      return $(this).data('tt-timer') === cfg.scope + ':' + cfg.objId;
++    });
++  }
++  function tick() {
++    var $in = timedInputs();
++    if (!$in.length) {        // left this page: stop
++      if (T.iv && !$('.tt-row[data-tt-key="' + cfg.scope + ':' + cfg.objId + '"]').length) {
++        clearInterval(T.iv); T.iv = null;
++      }
++      return;
++    }
++    var txt = clock(elapsedSec());
++    $in.val(txt).toggleClass('tt-running', T.running).toggleClass('tt-paused', !T.running);
++    $('.tt-row[data-tt-key="' + cfg.scope + ':' + cfg.objId + '"] a.tt-pause i')
++      .attr('class', T.running ? 'icon-pause' : 'icon-play');
++  }
++  function attachTimer($in) {
++    $in.data('tt-timer', cfg.scope + ':' + cfg.objId)
++       .attr('title', 'Timer running. Click to type a time instead.');
++    if (!T.iv) T.iv = setInterval(tick, 1000);
++    tick();
++  }
++  // Stop the timer driving this box (agent types a time, or the form posts)
++  function detachTimer($in, value) {
++    if (!$in.data('tt-timer')) return;
++    $in.removeData('tt-timer').removeClass('tt-running tt-paused').removeAttr('title');
++    $in.val(value);
++  }
++
++  function row(single) {
++    var unit = cfg.unit === 'hours' ? 'hours' : 'h:mm';
++    var hint = cfg.scope === 'A'
++      ? 'Added to the task totals and the parent ticket. '
++      : 'Added to the ticket totals. ';
++    var label = '<label><strong>Time / Cost:</strong></label>';
++    function roundLabel() {
++      var m = cfg.roundMin || 1;
++      return m === 1 ? 'the next minute' : m === 60 ? 'the next hour'
++        : 'the next ' + parseFloat((m / 60).toFixed(2)) + ' h';
++    }
++    var inputs =
++        '<input type="text" class="tt-time" name="tt_time" autocomplete="off" ' +
++          'placeholder="' + (unit === 'hours' ? '1.5' : '1:30') + '"> ' +
++        (cfg.timer
++          ? '<a href="#" class="tt-tbtn tt-pause no-pjax" title="Pause / resume timer"><i class="icon-pause"></i></a>' +
++            '<a href="#" class="tt-tbtn tt-reset no-pjax" title="Restart timer from zero"><i class="icon-refresh"></i></a> '
++          : '') +
++        '<span class="faded">' + unit + '</span>' +
++        '&nbsp;&nbsp;&nbsp;' + esc(cfg.currency) +
++        '<input type="text" class="tt-cost" name="tt_cost" autocomplete="off" placeholder="0.00">' +
++        '<span class="faded tt-hint">' + hint +
++          (cfg.timer ? 'The timer is rounded up to ' + roundLabel() + ' when you post; click the box to type a time instead. '
++                     : 'Accepts 1.5, 1:30, 1h 30m or 45m; use a negative value to correct.') + '</span>' +
++        '<div class="error tt-error" style="display:none">Invalid time or cost ' +
++          '&mdash; correct it before posting.</div>';
++    // Ticket forms use a label column; task forms are a single column
++    return $(single
++      ? '<tr class="tt-row"><td><div>' + label + '&nbsp; ' + inputs + '</div></td></tr>'
++      : '<tr class="tt-row"><td width="120">' + label + '</td><td>' + inputs + '</td></tr>');
++  }
++
++  function addTo(formSel, statusSel, action) {
++    var $form = $(formSel);
++    if (!$form.length || $form.find('.tt-row').length) return;
++    var $status = $form.find(statusSel).first().closest('tr');
++    var $r = row($status.length && $status.children('td').length === 1);
++    if ($status.length) $r.insertBefore($status);
++    else $form.find('table').last().append($r);
++
++    $r.attr('data-tt-key', cfg.scope + ':' + cfg.objId);
++    var $time = $r.find('.tt-time');
++    var prefilled = cfg.prefill.action === action
++      && (cfg.prefill.time !== '' || cfg.prefill.cost !== '');
++    if (prefilled) {
++      $time.val(cfg.prefill.time);
++      $r.find('.tt-cost').val(cfg.prefill.cost);
++    }
++    if (cfg.timer) {
++      if (!prefilled) attachTimer($time);
++      // Clicking into the box hands it over to the agent (rounded value
++      // pre-selected, so typing replaces it)
++      $time.on('focus.tt', function() {
++        if ($(this).data('tt-timer')) {
++          detachTimer($(this), roundedValue(elapsedSec()));
++          this.select();
++        }
++      });
++      $r.find('a.tt-pause').on('click', function(e) {
++        e.preventDefault();
++        if (T.running) { T.accum = elapsedSec(); T.running = false; }
++        else { T.start = Date.now(); T.running = true; }
++        if (!$time.data('tt-timer')) attachTimer($time);
++        tick();
++      });
++      $r.find('a.tt-reset').on('click', function(e) {
++        e.preventDefault();
++        T.accum = 0; T.start = Date.now();
++        $('.tt-row[data-tt-key="' + cfg.scope + ':' + cfg.objId + '"] input.tt-time').each(function() {
++          attachTimer($(this));
++        });
++        tick();
++      });
++    }
++
++    function validate() {
++      var ok = true;
++      $r.find('.tt-time, .tt-cost').each(function() {
++        if ($(this).data('tt-timer')) return;     // live timer, converted on post
++        var v = $.trim(this.value), re = $(this).hasClass('tt-time') ? timeRe : costRe;
++        var bad = v !== '' && !re.test(v);
++        $(this).toggleClass('tt-invalid', bad);
++        if (bad) ok = false;
++      });
++      $r.find('.tt-error').toggle(!ok);
++      return ok;
++    }
++    $r.find('.tt-time, .tt-cost').on('change blur', validate);
++
++    // osTicket binds its own submit handler (overlay + disabled buttons)
++    // when the page loads, so validate on the button click, which fires
++    // first -- including implicit submits from pressing Enter.
++    $form.on('click.tt', 'input[type=submit], button[type=submit]', function(e) {
++      // Timer still running in this box: post the rounded-up time
++      if ($time.data('tt-timer'))
++        detachTimer($time, roundedValue(elapsedSec()));
++      if (!validate()) {
++        e.preventDefault();
++        e.stopImmediatePropagation();
++        $r.find('.tt-invalid').first().focus();
++        return false;
++      }
++    });
++  }
++
++  function badges() {
++    $.each(cfg.badges, function(id, text) {
++      var $h = $('#thread-entry-' + id + ' .header .textra').first();
++      if ($h.length && !$h.find('.tt-badge').length)
++        $h.prepend('<span class="label label-bare tt-badge" title="Time / Cost logged">' +
++          '<i class="icon-time"></i> ' + esc(text) + '</span>');
++    });
++  }
++
++  /* ---- Ticket: breakdown panel + Time/Cost columns on the Tasks tab ---- */
++  var summary = null, loading = false;
++
++  function renderPanel() {
++    $('#tt-summary').remove();
++    if (!summary) return;
++    var any = summary.total.minutes || summary.total.amount;
++    $.each(summary.tasks, function(i, t) { if (t.minutes || t.amount) any = true; });
++    if (!any) return;
++    var rows = '<tr><td>' + 'This ticket' + '</td><td></td>' +
++      '<td class="num">' + esc(summary.ticket.time) + '</td>' +
++      '<td class="num">' + esc(summary.ticket.cost) + '</td></tr>';
++    $.each(summary.tasks, function(i, t) {
++      rows += '<tr><td><a href="tasks.php?id=' + t.id + '">Task #' + esc(t.number) + '</a> &mdash; ' +
++        esc(t.title) + '</td><td>' + esc(t.status) + '</td>' +
++        '<td class="num">' + esc(t.time) + '</td><td class="num">' + esc(t.cost) + '</td></tr>';
++    });
++    rows += '<tr class="tt-total"><td>Total</td><td></td>' +
++      '<td class="num">' + esc(summary.total.time) + '</td>' +
++      '<td class="num">' + esc(summary.total.cost) + '</td></tr>';
++    var $p = $('<div id="tt-summary"><h4><i class="icon-time"></i> Time &amp; Cost</h4>' +
++      '<table><thead><tr><th>Logged on</th><th>Status</th><th class="num">Time</th>' +
++      '<th class="num">Cost</th></tr></thead><tbody>' + rows + '</tbody></table></div>');
++    var $tabs = $('ul#ticket_tabs');
++    if ($tabs.length) $p.insertBefore($tabs);
++  }
++
++  function decorateTasks() {
++    var $form = $('form#tasks[action="#tickets/' + cfg.ticketId + '/tasks"]');
++    if (!summary || !$form.length) return;
++    var $table = $form.find('table.list').first();
++    if (!$table.data('tt-cols')) {
++      $table.data('tt-cols', 1);
++      $table.find('thead tr').append('<th class="tt-col" width="70">Time</th><th class="tt-col" width="80">Cost</th>');
++    }
++    var byId = {};
++    $.each(summary.tasks, function(i, t) { byId[t.id] = t; });
++    $table.find('tbody.tasks > tr[id]').each(function() {
++      var t = byId[this.id], $c = $(this).children('td.tt-col');
++      if (!$c.length)
++        $c = $('<td class="tt-col"></td><td class="tt-col"></td>').appendTo(this);
++      $c.eq(0).text(t ? t.time : '');
++      $c.eq(1).text(t ? t.cost : '');
++    });
++  }
++
++  function refresh() {
++    if (!cfg.summaryUrl || loading) return;
++    loading = true;
++    $.ajax({url: cfg.summaryUrl, dataType: 'json', cache: false})
++      .done(function(data) { summary = data; renderPanel(); decorateTasks(); })
++      .always(function() { loading = false; });
++  }
++
++  function watchTasks() {
++    if (!window.MutationObserver || !cfg.ticketId) return;
++    if (window.__ttObserver) window.__ttObserver.disconnect();
++    var timer;
++    window.__ttObserver = new MutationObserver(function() {
++      clearTimeout(timer);
++      timer = setTimeout(function() {
++        // Left this ticket (PJAX navigation): stop watching
++        if (!$('form#reply input[name=id][value="' + cfg.ticketId + '"]').length &&
++            !$('form#note input[name=id][value="' + cfg.ticketId + '"]').length &&
++            !$('ul#ticket_tabs').length) {
++          window.__ttObserver.disconnect();
++          return;
++        }
++        var $t = $('form#tasks[action="#tickets/' + cfg.ticketId + '/tasks"] table.list').first();
++        if ($t.length && !$t.data('tt-cols')) refresh();   // tasks list (re)loaded
++      }, 150);
++    });
++    window.__ttObserver.observe(document.body, {childList: true, subtree: true});
++    // "All Tasks" just re-shows the cached list: refresh the numbers
++    $(document).off('click.ttsum').on('click.ttsum', '#all-ticket-tasks, a#ticket-tasks-tab', function() {
++      setTimeout(refresh, 50);
++    });
++  }
++
++  function init() {
++    if (cfg.scope === 'A') {
++      addTo('#task_reply', 'select[name="task:status"]', 'postreply');
++      addTo('#task_note', 'select[name="task:status"]', 'postnote');
++    } else {
++      addTo('#reply', 'select[name=reply_status_id]', 'reply');
++      addTo('#note', 'select[name=note_status_id]', 'postnote');
++    }
++    badges();
++    if (cfg.scope === 'T') { refresh(); watchTasks(); }
++  }
++
++  // Works for a normal page load, PJAX navigation and tasks loaded by AJAX
++  $(function() { setTimeout(init, 0); });
++})(jQuery);
++</script>
+diff --git a/include/staff/header.inc.php b/include/staff/header.inc.php
+index 9ac217c..893ee22 100644
+--- a/include/staff/header.inc.php
++++ b/include/staff/header.inc.php
+@@ -35,6 +35,7 @@ if (osTicket::is_ie())
+     <script type="text/javascript" src="<?php echo ROOT_PATH; ?>js/jquery-3.7.0.min.js"></script>
+     <link rel="stylesheet" href="<?php echo ROOT_PATH ?>css/thread.css" media="all">
+     <link rel="stylesheet" href="<?php echo ROOT_PATH ?>scp/css/scp.css" media="all">
++    <link rel="stylesheet" href="<?php echo ROOT_PATH ?>scp/css/custom.css" media="all">
+     <link rel="stylesheet" href="<?php echo ROOT_PATH; ?>css/redactor.css" media="screen">
+     <link rel="stylesheet" href="<?php echo ROOT_PATH ?>css/typeahead.css" media="screen">
+     <link type="text/css" href="<?php echo ROOT_PATH; ?>css/ui-lightness/jquery-ui-1.13.2.custom.min.css"
+diff --git a/include/staff/tasks.inc.php b/include/staff/tasks.inc.php
+index 052b705..b5c343c 100644
+--- a/include/staff/tasks.inc.php
++++ b/include/staff/tasks.inc.php
+@@ -37,7 +37,7 @@ $queue_columns = array(
+             'sort_col' => 'created',
+             ),
+         'title' => array(
+-            'width' => '38%',
++            'width' => '28%',
+             'heading' => __('Title'),
+             'sort_col' => 'cdata__title',
+             ),
+@@ -50,6 +50,11 @@ $queue_columns = array(
+             'width' => '16%',
+             'heading' => __('Agent'),
+             ),
++        'status' => array(
++            'width' => '10%',
++            'heading' => __('Status'),
++            'sort_col' => 'flags',
++            ),
+         );
+ 
+ 
+@@ -85,10 +90,14 @@ case 'search':
+     // Consider basic search
+     if ($_REQUEST['query']) {
+         $results_type=__('Search Results');
+-        $tasks = $tasks->filter(Q::any(array(
+-            'number__startswith' => $_REQUEST['query'],
+-            'cdata__title__contains' => $_REQUEST['query'],
+-        )));
++        // Allow plugins (e.g. Search Plus) to handle the task search
++        $search = array('query' => $_REQUEST['query'], 'handled' => false);
++        Signal::send('tasks.search', $tasks, $search);
++        if (!$search['handled'])
++            $tasks = $tasks->filter(Q::any(array(
++                'number__startswith' => $_REQUEST['query'],
++                'cdata__title__contains' => $_REQUEST['query'],
++            )));
+         unset($_SESSION[$queue_key]);
+         break;
+     }
+@@ -423,6 +432,11 @@ if ($thisstaff->hasPerm(Task::PERM_DELETE, false)) {
+                 </td>
+                 <td nowrap>&nbsp;<?php echo Format::truncate($dept, 40); ?></td>
+                 <td nowrap>&nbsp;<?php echo $assignee; ?></td>
++                <td nowrap>&nbsp;<?php
++                    $sdata = array('id' => $T['id'], 'isopen' => (bool) $T['isopen'],
++                        'status' => $T['isopen'] ? __('Open') : __('Completed'));
++                    Signal::send('task.status.name', $T, $sdata);
++                    echo Format::htmlchars($sdata['status']); ?></td>
+             </tr>
+             <?php
+             } //end of foreach
+@@ -432,7 +446,7 @@ if ($thisstaff->hasPerm(Task::PERM_DELETE, false)) {
+     </tbody>
+     <tfoot>
+      <tr>
+-        <td colspan="7">
++        <td colspan="8">
+             <?php if($total && $thisstaff->canManageTickets()){ ?>
+             <?php echo __('Select');?>:&nbsp;
+             <a id="selectAll" href="#ckb"><?php echo __('All');?></a>&nbsp;&nbsp;
+diff --git a/include/staff/ticket-tasks.inc.php b/include/staff/ticket-tasks.inc.php
+index b6f4b65..02cad06 100644
+--- a/include/staff/ticket-tasks.inc.php
++++ b/include/staff/ticket-tasks.inc.php
+@@ -92,7 +92,9 @@ if ($count) { ?>
+                     Format::truncate($task->getAssigned(),40));
+         }
+ 
+-        $status = $task->isOpen() ? '<strong>'.__('Open').'</strong>': __('Closed');
++        $status = Format::htmlchars($task->getStatus());
++        if ($task->isOpen())
++            $status = '<strong>'.$status.'</strong>';
+ 
+         $title = Format::htmlchars(Format::truncate($task->getTitle(),40));
+         $threadcount = $task->getThread() ?
+diff --git a/scp/css/custom.css b/scp/css/custom.css
+new file mode 100644
+index 0000000..8e9179c
+--- /dev/null
++++ b/scp/css/custom.css
+@@ -0,0 +1,40 @@
++/*
++ * Local customizations for osTicket (staff panel).
++ * Loaded after scp.css from include/staff/header.inc.php.
++ */
++
++/* 1. Full-width staff layout (stock is fixed at 960px) */
++#container {
++    width: auto;
++    margin: 0 15px 20px 15px;
++}
++.jb-overflowmenu {
++    width: auto;
++}
++/* Templates hard-code width="940" on ticket lists, ticket view and
++   most other tables; stretch them to the container. */
++#content table[width="940"] {
++    width: 100%;
++}
++
++/* Rich-text editors (Post Reply, Internal Note, task updates): osTicket
++   limits the typing area to 950px and centres it, which leaves it floating
++   in the middle of a full-width page. Use the full width of the box. */
++.redactor-box .redactor-styles {
++    max-width: none !important;
++    margin-left: 0 !important;
++    margin-right: 0 !important;
++}
++
++/* Taller reply / note / task-update editors, resizable by dragging the
++   bottom-right corner. (Stock height is 150px.) */
++#reply .redactor-box .redactor-styles,
++#note .redactor-box .redactor-styles,
++#task_reply .redactor-box .redactor-styles,
++#task_note .redactor-box .redactor-styles {
++    min-height: 300px !important;
++}
++.redactor-box .redactor-styles {
++    resize: vertical;
++    overflow-y: auto;
++}
+diff --git a/scp/tickets.php b/scp/tickets.php
+index 11a430a..053245a 100644
+--- a/scp/tickets.php
++++ b/scp/tickets.php
+@@ -85,7 +85,9 @@ if (!$ticket) {
+         && ($_GET['query'])
+     ) {
+         $wc = mb_str_wc($_GET['query']);
+-        if ($wc < 4) {
++        $maxwc = class_exists('SearchPlusPlugin') && SearchPlusPlugin::$opts
++            ? SearchPlusPlugin::$opts['max_terms'] : 3;
++        if ($wc <= $maxwc) {
+             $key = substr(md5($_GET['query']), -10);
+             if ($_GET['search-type'] == 'typeahead'
+                     || Validator::is_emailish($_GET['query'])) {
+@@ -104,7 +106,7 @@ if (!$ticket) {
+             $queue_id = "adhoc,{$key}";
+         } else {
+             $errors['err'] = sprintf(
+-                    __('Search term cannot have more than %d keywords'), 4);
++                    __('Search term cannot have more than %d keywords'), $maxwc);
+         }
+     }
+ 
