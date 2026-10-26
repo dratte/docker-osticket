@@ -164,7 +164,7 @@ This image currently supports three volumes. None of these need to used if you d
 `/data/upload/include/plugins`
 
 This is the location where any OSTicket plugins, like [the core plugins](https://github.com/osTicket/core-plugins),
-can be placed. Plugins are not included in this image and hence should be maintained in a separate linked Docker
+can be placed. Standard Plugins are not included in this image and hence should be maintained in a separate linked Docker
 container or the host filesystem.
 
 `/data/upload/include/i18n`
