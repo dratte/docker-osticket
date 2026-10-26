@@ -106,6 +106,12 @@ RUN set -x && \
     # chown nginx:www-data /var/tmp/nginx && chmod g+rx /var/tmp/nginx
  
 COPY files/ /
+# Agent sessions: osTicket caps its session lifetime at PHP's
+# session.gc_maxlifetime, which defaults to 1440 s (24 min). Raise it so an
+# open ticket doesn't log the agent out (8 h; use 86400 for 24 h). Written
+# after COPY files/ and named zz- so it overrides any earlier ini.
+RUN printf 'session.gc_maxlifetime = 28800\n' > /usr/local/etc/php/conf.d/zz-osticket-session.ini
+
 VOLUME ["/data/upload/include/plugins","/data/upload/include/i18n"]
 EXPOSE 80
 CMD ["/data/bin/start.sh"]
