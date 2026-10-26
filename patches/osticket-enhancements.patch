@@ -1,3 +1,17 @@
+diff --git a/include/class.nav.php b/include/class.nav.php
+index d0f14b0..20e5822 100644
+--- a/include/class.nav.php
++++ b/include/class.nav.php
+@@ -161,6 +161,9 @@ class StaffNav {
+                     $subnav[]=array('desc'=>__('Dashboard'),'href'=>'dashboard.php','iconclass'=>'logs');
+                     $subnav[]=array('desc'=>__('Agent Directory'),'href'=>'directory.php','iconclass'=>'teams');
+                     $subnav[]=array('desc'=>__('My Profile'),'href'=>'profile.php','iconclass'=>'users');
++                    // Time & Cost Reports (Time & Cost Tracking plugin)
++                    if (class_exists('TimeReports', false) && TimeReports::canView($staff))
++                        $subnav[]=array('desc'=>__('Time & Cost Reports'),'href'=>'timereports.php','iconclass'=>'logs');
+                     break;
+                 case 'users':
+                     $subnav[] = array('desc' => __('User Directory'), 'href' => 'users.php', 'iconclass' => 'teams');
 diff --git a/include/class.search.php b/include/class.search.php
 index 829115f..fff648e 100755
 --- a/include/class.search.php
@@ -1356,10 +1370,10 @@ index 0000000..b9a299c
 +);
 diff --git a/include/plugins/time-tracking/config.php b/include/plugins/time-tracking/config.php
 new file mode 100644
-index 0000000..3a2ab1f
+index 0000000..fe383b5
 --- /dev/null
 +++ b/include/plugins/time-tracking/config.php
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,109 @@
 +<?php
 +require_once INCLUDE_DIR . 'class.plugin.php';
 +require_once INCLUDE_DIR . 'class.forms.php';
@@ -1424,6 +1438,23 @@ index 0000000..3a2ab1f
 +                    Cost field total is stored as a plain number.',
 +                'configuration' => array('size' => 5, 'length' => 8),
 +            )),
++            'reports_section' => new SectionBreakField(array(
++                'label' => 'Reports',
++                'hint' => 'Dashboard > Time & Cost Reports. Admins see all
++                    tickets; department managers see their departments.',
++            )),
++            'reports' => new BooleanField(array(
++                'label' => 'Time & Cost Reports',
++                'default' => true,
++                'configuration' => array('desc' => 'Enable the reports page'),
++            )),
++            'category_field' => new TextboxField(array(
++                'label' => 'Category field variable',
++                'default' => 'category',
++                'hint' => 'Variable name of the ticket form field that holds
++                    the category reports are grouped by.',
++                'configuration' => array('size' => 30, 'length' => 64),
++            )),
 +            'timer_section' => new SectionBreakField(array(
 +                'label' => 'Timer',
 +            )),
@@ -1454,7 +1485,7 @@ index 0000000..3a2ab1f
 +}
 diff --git a/include/plugins/time-tracking/plugin.php b/include/plugins/time-tracking/plugin.php
 new file mode 100644
-index 0000000..463dbf9
+index 0000000..a6ea0db
 --- /dev/null
 +++ b/include/plugins/time-tracking/plugin.php
 @@ -0,0 +1,14 @@
@@ -1462,7 +1493,7 @@ index 0000000..463dbf9
 +
 +return array(
 +    'id' =>             'community:time-tracking', # notrans
-+    'version' =>        '1.3.0',
++    'version' =>        '1.9.1',
 +    'ost_version' =>    '1.17',
 +    'name' =>           /* trans */ 'Time & Cost Tracking',
 +    'author' =>         'Community contributors',
@@ -1472,12 +1503,1516 @@ index 0000000..463dbf9
 +        time rolling up into the parent ticket.',
 +    'plugin' =>         'timetracking.php:TimeTrackingPlugin',
 +);
+diff --git a/include/plugins/time-tracking/reports.php b/include/plugins/time-tracking/reports.php
+new file mode 100644
+index 0000000..6d17332
+--- /dev/null
++++ b/include/plugins/time-tracking/reports.php
+@@ -0,0 +1,1193 @@
++<?php
++/*********************************************************************
++ * Time & Cost Reports (part of the Time & Cost Tracking plugin)
++ *
++ * Staff page: scp/timereports.php (Dashboard > Time & Cost Reports)
++ *
++ *  - Period: This/Last Month, Quarter, Year, Last 30/90 days,
++ *    Last 12 months, Year to date, All time, or custom dates.
++ *    Entries count in the period in which the time/cost was logged.
++ *  - Roll-up: Category (custom ticket field) > Ticket > ticket itself +
++ *    each task. Standalone tasks are grouped separately.
++ *  - Comparison chart: year-over-year by year, quarter or month, for
++ *    cost or hours, all categories or one.
++ *  - Export: Excel (.xlsx) or CSV of the detailed rows.
++ *  - Access: admins see everything; department managers see tickets
++ *    (and standalone tasks) of the departments they manage.
++ *********************************************************************/
++
++class TimeReports {
++
++    /* ---------------------------------------------------------------
++     * Access
++     * ------------------------------------------------------------- */
++
++    static function enabled() {
++        return class_exists('TimeTrackingPlugin', false)
++            && TimeTrackingPlugin::$opts
++            && !empty(TimeTrackingPlugin::$opts['reports']);
++    }
++
++    /** null = everything (admin); array of dept ids (manager); false = none */
++    static function scope($staff) {
++        if (!$staff || !self::enabled())
++            return false;
++        if ($staff->isAdmin())
++            return null;
++        $ids = array();
++        foreach (Dept::objects()->filter(array('manager_id' => $staff->getId()))
++                ->values_flat('id') as $row)
++            $ids[] = (int) $row[0];
++        return $ids ?: false;
++    }
++
++    static function canView($staff) {
++        return self::scope($staff) !== false;
++    }
++
++    /* ---------------------------------------------------------------
++     * Periods
++     * ------------------------------------------------------------- */
++
++    static function periods() {
++        return array(
++            'this_month'    => 'This Month',
++            'last_month'    => 'Last Month',
++            'this_quarter'  => 'This Quarter',
++            'last_quarter'  => 'Last Quarter',
++            'this_year'     => 'This Year',
++            'last_year'     => 'Last Year',
++            'last_30'       => 'Last 30 Days',
++            'last_90'       => 'Last 90 Days',
++            'last_12m'      => 'Last 12 Months',
++            'all'           => 'All Time',
++            'custom'        => 'Custom Dates',
++        );
++    }
++
++    static function userTz() {
++        global $cfg;
++        try {
++            return new DateTimeZone($cfg->getTimezone() ?: 'UTC');
++        } catch (Exception $e) {
++            return new DateTimeZone('UTC');
++        }
++    }
++
++    static function dbTz() {
++        global $cfg;
++        try {
++            return new DateTimeZone($cfg->getDbTimezone() ?: 'UTC');
++        } catch (Exception $e) {
++            return new DateTimeZone('UTC');
++        }
++    }
++
++    /**
++     * Returns array(start DateTime|null, end DateTime|null (exclusive),
++     * label) in the user's timezone.
++     */
++    static function resolve($key, $from='', $to='') {
++        $tz = self::userTz();
++        $now = new DateTime('now', $tz);
++        $y = (int) $now->format('Y');
++        $m = (int) $now->format('n');
++        $q = intdiv($m - 1, 3);              // 0..3
++        $mk = function($y, $m, $d=1) use ($tz) {
++            $dt = new DateTime('now', $tz);
++            $dt->setDate($y, $m, $d)->setTime(0, 0, 0);
++            return $dt;
++        };
++        $today = $mk($y, $m, (int) $now->format('j'));
++        $tomorrow = (clone $today)->modify('+1 day');
++        switch ($key) {
++        case 'last_month':
++            $s = $mk($y, $m)->modify('-1 month');
++            return array($s, $mk($y, $m), $s->format('F Y'));
++        case 'this_quarter':
++            $s = $mk($y, $q * 3 + 1);
++            return array($s, (clone $s)->modify('+3 months'), 'Q' . ($q + 1) . ' ' . $y);
++        case 'last_quarter':
++            $s = $mk($y, $q * 3 + 1)->modify('-3 months');
++            return array($s, $mk($y, $q * 3 + 1),
++                'Q' . (intdiv((int) $s->format('n') - 1, 3) + 1) . ' ' . $s->format('Y'));
++        case 'this_year':
++            return array($mk($y, 1), $mk($y + 1, 1), (string) $y);
++        case 'last_year':
++            return array($mk($y - 1, 1), $mk($y, 1), (string) ($y - 1));
++        case 'last_30':
++            return array((clone $tomorrow)->modify('-30 days'), $tomorrow, 'Last 30 days');
++        case 'last_90':
++            return array((clone $tomorrow)->modify('-90 days'), $tomorrow, 'Last 90 days');
++        case 'last_12m':
++            $s = $mk($y, $m)->modify('-11 months');
++            return array($s, $mk($y, $m)->modify('+1 month'),
++                $s->format('M Y') . ' – ' . $now->format('M Y'));
++        case 'all':
++            return array(null, null, 'All time');
++        case 'custom':
++            $s = self::parseDate($from, $tz);
++            $e = self::parseDate($to, $tz);
++            if ($s && $e && $e < $s)
++                list($s, $e) = array($e, $s);
++            $label = ($s ? $s->format('M j, Y') : '…') . ' – ' . ($e ? $e->format('M j, Y') : '…');
++            return array($s, $e ? $e->modify('+1 day') : null, $label);
++        case 'this_month':
++        default:
++            $s = $mk($y, $m);
++            return array($s, (clone $s)->modify('+1 month'), $s->format('F Y'));
++        }
++    }
++
++    static function parseDate($s, $tz) {
++        $s = trim((string) $s);
++        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $s))
++            return null;
++        $d = DateTime::createFromFormat('!Y-m-d', $s, $tz);
++        return $d ?: null;
++    }
++
++    /** Local DateTime -> 'Y-m-d H:i:s' in the database timezone */
++    static function toDb($dt) {
++        $d = clone $dt;
++        $d->setTimezone(self::dbTz());
++        return $d->format('Y-m-d H:i:s');
++    }
++
++    /** DB datetime string -> DateTime in the user's timezone */
++    static function fromDb($s) {
++        $d = new DateTime($s, self::dbTz());
++        $d->setTimezone(self::userTz());
++        return $d;
++    }
++
++    /* ---------------------------------------------------------------
++     * Data
++     * ------------------------------------------------------------- */
++
++    /** Raw entries in [start, end) visible in $scope */
++    static function entries($start, $end, $scope) {
++        if (!TimeTrackingPlugin::ensureSchema())
++            return array();
++        $P = TABLE_PREFIX;
++        $w = array('1');
++        if ($start)
++            $w[] = 'e.created >= ' . db_input(self::toDb($start));
++        if ($end)
++            $w[] = 'e.created < ' . db_input(self::toDb($end));
++        if (is_array($scope)) {
++            $ids = implode(',', array_map('intval', $scope));
++            $w[] = "((e.ticket_id > 0 AND t.dept_id IN ($ids))
++                     OR (e.ticket_id = 0 AND k.dept_id IN ($ids)))";
++        }
++        $sql = "SELECT e.object_type, e.object_id, e.ticket_id, e.minutes, e.cost, e.created
++                FROM `" . TimeTrackingPlugin::table() . "` e
++                LEFT JOIN `{$P}ticket` t ON (t.ticket_id = e.ticket_id)
++                LEFT JOIN `{$P}task` k ON (e.object_type = 'A' AND k.id = e.object_id)
++                WHERE " . implode(' AND ', $w) . "
++                  AND (e.ticket_id = 0 OR t.ticket_id IS NOT NULL)";
++        $rows = array();
++        $res = db_query($sql);
++        while ($res && ($r = db_fetch_array($res)))
++            $rows[] = $r;
++        return $rows;
++    }
++
++    /** ticket_id => category label */
++    static function categories($ticketIds) {
++        $out = array();
++        if (!$ticketIds)
++            return $out;
++        $field = TimeTrackingPlugin::$opts['category_field'];
++        $P = TABLE_PREFIX;
++        $res = db_query(sprintf(
++            "SELECT fe.object_id, fv.value FROM `{$P}form_entry` fe
++             JOIN `{$P}form_entry_values` fv ON (fv.entry_id = fe.id)
++             JOIN `{$P}form_field` ff ON (ff.id = fv.field_id)
++             WHERE fe.object_type = 'T' AND ff.name = %s AND fe.object_id IN (%s)",
++            db_input($field), implode(',', array_map('intval', $ticketIds))));
++        while ($res && ($r = db_fetch_array($res))) {
++            $v = trim((string) $r['value']);
++            if ($v !== '' && ($j = json_decode($v, true)) && is_array($j))
++                $v = implode(', ', array_map('strval', array_values($j)));
++            if ($v !== '')
++                $out[(int) $r['object_id']] = $v;
++        }
++        return $out;
++    }
++
++    static function ticketInfo($ids) {
++        $out = array();
++        if (!$ids)
++            return $out;
++        $dt = function($v) { return $v ? self::fromDb($v) : null; };
++        foreach (Ticket::objects()->filter(array('ticket_id__in' => $ids))
++                ->values('ticket_id', 'number', 'cdata__subject', 'status__name', 'status__state',
++                    'created', 'lastupdate', 'user__name', 'user__default_email__address',
++                    'staff__firstname', 'staff__lastname', 'team__name') as $t) {
++            $staff = trim($t['staff__firstname'] . ' ' . $t['staff__lastname']);
++            $out[(int) $t['ticket_id']] = array(
++                'number' => $t['number'],
++                'subject' => (string) $t['cdata__subject'],
++                'status' => (string) $t['status__name'],
++                'state' => (string) $t['status__state'],
++                'created' => $dt($t['created']),
++                'updated' => $dt($t['lastupdate']),
++                'requester' => (string) $t['user__name'],
++                'email' => (string) $t['user__default_email__address'],
++                'assignee' => $staff !== '' ? $staff : (string) $t['team__name'],
++            );
++        }
++        return $out;
++    }
++
++    static function taskInfo($ids) {
++        $out = array();
++        if (!$ids)
++            return $out;
++        foreach (Task::objects()->filter(array('id__in' => $ids)) as $t)
++            $out[(int) $t->getId()] = array(
++                'number' => $t->getNumber(),
++                'title' => (string) $t->getTitle(),
++                'status' => (string) $t->getStatus(),
++                'state' => $t->isOpen() ? 'open' : 'closed',
++                'assignee' => (string) $t->getAssigned(),
++                'created' => $t->created ? self::fromDb($t->created) : null,
++                'updated' => $t->updated ? self::fromDb($t->updated) : null,
++            );
++        return $out;
++    }
++
++    /**
++     * Build the Category > Ticket > (ticket, tasks) tree.
++     * Each node: minutes, cost.
++     */
++    static function rollup($rows) {
++        $ticketIds = $taskIds = array();
++        foreach ($rows as $r) {
++            if ((int) $r['ticket_id'])
++                $ticketIds[(int) $r['ticket_id']] = true;
++            if ($r['object_type'] === 'A')
++                $taskIds[(int) $r['object_id']] = true;
++        }
++        $cats = self::categories(array_keys($ticketIds));
++        $tinfo = self::ticketInfo(array_keys($ticketIds));
++        $kinfo = self::taskInfo(array_keys($taskIds));
++
++        $tree = array();
++        $total = array('minutes' => 0, 'cost' => 0.0, 'tickets' => 0, 'tasks' => 0);
++        foreach ($rows as $r) {
++            $tid = (int) $r['ticket_id'];
++            $cat = $tid ? (isset($cats[$tid]) ? $cats[$tid] : '(No category)')
++                        : '(Standalone tasks)';
++            $min = (int) $r['minutes'];
++            $cost = (float) $r['cost'];
++            if (!isset($tree[$cat]))
++                $tree[$cat] = array('minutes' => 0, 'cost' => 0.0, 'tickets' => array());
++            $tree[$cat]['minutes'] += $min;
++            $tree[$cat]['cost'] += $cost;
++            $tk = $tid ?: 'standalone';
++            if (!isset($tree[$cat]['tickets'][$tk]))
++                $tree[$cat]['tickets'][$tk] = array(
++                    'id' => $tid,
++                    'info' => $tid && isset($tinfo[$tid]) ? $tinfo[$tid]
++                        : array('number' => '', 'subject' => '', 'status' => '', 'state' => '',
++                            'created' => null, 'updated' => null, 'requester' => '',
++                            'email' => '', 'assignee' => ''),
++                    'minutes' => 0, 'cost' => 0.0,
++                    'own' => array('minutes' => 0, 'cost' => 0.0),
++                    'tasks' => array());
++            $T =& $tree[$cat]['tickets'][$tk];
++            $T['minutes'] += $min;
++            $T['cost'] += $cost;
++            if ($r['object_type'] === 'A') {
++                $kid = (int) $r['object_id'];
++                if (!isset($T['tasks'][$kid]))
++                    $T['tasks'][$kid] = array('id' => $kid,
++                        'info' => isset($kinfo[$kid]) ? $kinfo[$kid]
++                            : array('number' => $kid, 'title' => '(deleted task)', 'status' => ''),
++                        'minutes' => 0, 'cost' => 0.0);
++                $T['tasks'][$kid]['minutes'] += $min;
++                $T['tasks'][$kid]['cost'] += $cost;
++            } else {
++                $T['own']['minutes'] += $min;
++                $T['own']['cost'] += $cost;
++            }
++            unset($T);
++            $total['minutes'] += $min;
++            $total['cost'] += $cost;
++        }
++        // Sort: categories by cost desc, tickets by cost desc
++        uasort($tree, function($a, $b) { return $b['cost'] <=> $a['cost']; });
++        foreach ($tree as &$c) {
++            uasort($c['tickets'], function($a, $b) { return $b['cost'] <=> $a['cost']; });
++            foreach ($c['tickets'] as $t) {
++                if ($t['id']) $total['tickets']++;
++                $total['tasks'] += count($t['tasks']);
++            }
++        }
++        unset($c);
++        return array($tree, $total);
++    }
++
++    /* ---------------------------------------------------------------
++     * Comparison (year over year)
++     * ------------------------------------------------------------- */
++
++    static function yearsWithData($scope) {
++        $years = array();
++        foreach (self::entries(null, null, $scope) as $r)
++            $years[(int) self::fromDb($r['created'])->format('Y')] = true;
++        krsort($years);
++        return array_keys($years);
++    }
++
++    /**
++     * Returns array(labels[], series[year => values[]]) for the selected
++     * years, bucketed by 'year' | 'quarter' | 'month'.
++     */
++    static function compare($years, $by, $metric, $category, $scope) {
++        $years = array_values(array_unique(array_map('intval', $years)));
++        sort($years);
++        if (!$years)
++            return array(array(), array());
++        $tz = self::userTz();
++        $s = new DateTime('now', $tz); $s->setDate(min($years), 1, 1)->setTime(0, 0, 0);
++        $e = new DateTime('now', $tz); $e->setDate(max($years) + 1, 1, 1)->setTime(0, 0, 0);
++        $rows = self::entries($s, $e, $scope);
++
++        $category = array_values(array_filter((array) $category, 'strlen'));
++        $cats = array();
++        if ($category) {
++            $tids = array();
++            foreach ($rows as $r) if ((int) $r['ticket_id']) $tids[(int) $r['ticket_id']] = 1;
++            $cats = self::categories(array_keys($tids));
++        }
++
++        if ($by === 'month')
++            $labels = array('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec');
++        elseif ($by === 'quarter')
++            $labels = array('Q1', 'Q2', 'Q3', 'Q4');
++        else
++            $labels = array_map('strval', $years);
++
++        $series = array();
++        foreach ($years as $y)
++            $series[$y] = array_fill(0, count($labels), 0.0);
++
++        foreach ($rows as $r) {
++            if ($category) {
++                $tid = (int) $r['ticket_id'];
++                $cat = $tid ? (isset($cats[$tid]) ? $cats[$tid] : '(No category)') : '(Standalone tasks)';
++                if (!in_array($cat, $category, true))
++                    continue;
++            }
++            $d = self::fromDb($r['created']);
++            $y = (int) $d->format('Y');
++            if (!isset($series[$y]))
++                continue;
++            $v = $metric === 'hours' ? ((int) $r['minutes']) / 60 : (float) $r['cost'];
++            if ($by === 'month')
++                $i = (int) $d->format('n') - 1;
++            elseif ($by === 'quarter')
++                $i = intdiv((int) $d->format('n') - 1, 3);
++            else
++                $i = array_search((string) $y, $labels);
++            $series[$y][$i] += $v;
++        }
++        if ($by === 'year') {
++            // One series ("Total") with a bar per year
++            $tot = array();
++            foreach ($years as $k => $y) $tot[$k] = $series[$y][$k];
++            $series = array('Total' => $tot);
++        }
++        return array($labels, $series);
++    }
++
++    /** Grouped bar chart as inline SVG */
++    static function svgChart($labels, $series, $metric) {
++        $colors = array('#4e79a7', '#f28e2b', '#59a14f', '#e15759', '#76b7b2',
++                        '#edc948', '#b07aa1', '#ff9da7', '#9c755f', '#bab0ac');
++        $W = 900; $H = 340; $L = 70; $R = 20; $Tp = 20; $B = 60;
++        $max = 0;
++        foreach ($series as $vals) foreach ($vals as $v) $max = max($max, $v);
++        $nice = self::niceMax($max ?: 1);
++        $pw = $W - $L - $R; $ph = $H - $Tp - $B;
++        $groups = max(1, count($labels));
++        $gw = $pw / $groups;
++        $ns = max(1, count($series));
++        $bw = min(40, ($gw * 0.8) / $ns);
++        $fmt = function($v) use ($metric) {
++            return $metric === 'hours'
++                ? number_format($v, 1) . ' h'
++                : TimeTrackingPlugin::$opts['currency'] . number_format($v, 0);
++        };
++        $h = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
++        $o = sprintf('<svg viewBox="0 0 %d %d" width="100%%" style="max-width:%dpx;font:12px sans-serif" role="img">',
++            $W, $H + 24, $W);
++        // grid + y labels
++        for ($i = 0; $i <= 4; $i++) {
++            $v = $nice * $i / 4;
++            $y = $Tp + $ph - $ph * $i / 4;
++            $o .= sprintf('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#e5e5e5"/>', $L, $y, $W - $R, $y);
++            $o .= sprintf('<text x="%d" y="%.1f" text-anchor="end" fill="#666">%s</text>', $L - 6, $y + 4, $h(self::axisLabel($v, $metric, $nice)));
++        }
++        $si = 0;
++        foreach ($series as $name => $vals) {
++            $c = $colors[$si % count($colors)];
++            foreach ($labels as $gi => $lab) {
++                $v = isset($vals[$gi]) ? $vals[$gi] : 0;
++                $bh = $nice ? $ph * $v / $nice : 0;
++                $x = $L + $gi * $gw + ($gw - $bw * $ns) / 2 + $si * $bw;
++                $y = $Tp + $ph - $bh;
++                $o .= sprintf('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="%s"><title>%s %s: %s</title></rect>',
++                    $x, $y, max(1, $bw - 2), max(0, $bh), $c, $h($name), $h($lab), $h($fmt($v)));
++                if ($v > 0 && $bw >= 18)
++                    $o .= sprintf('<text x="%.1f" y="%.1f" text-anchor="middle" fill="#333" font-size="10">%s</text>',
++                        $x + ($bw - 2) / 2, $y - 3, $h($fmt($v)));
++            }
++            $si++;
++        }
++        foreach ($labels as $gi => $lab)
++            $o .= sprintf('<text x="%.1f" y="%d" text-anchor="middle" fill="#333">%s</text>',
++                $L + $gi * $gw + $gw / 2, $Tp + $ph + 18, $h($lab));
++        $o .= sprintf('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#999"/>', $L, $Tp + $ph, $W - $R, $Tp + $ph);
++        // legend
++        $lx = $L; $si = 0;
++        foreach (array_keys($series) as $name) {
++            $c = $colors[$si++ % count($colors)];
++            $o .= sprintf('<rect x="%d" y="%d" width="12" height="12" fill="%s"/><text x="%d" y="%d" fill="#333">%s</text>',
++                $lx, $H + 6, $c, $lx + 16, $H + 16, $h($name));
++            $lx += 30 + 8 * strlen((string) $name);
++        }
++        return $o . '</svg>';
++    }
++
++    /**
++     * Line data: one series per category across the selected years as a
++     * continuous timeline (e.g. Q1 2025 ... Q4 2026). Returns
++     * array(labels[], series[name => values[]]).
++     */
++    static function compareLines($years, $by, $metric, $category, $scope, $withTotal=true) {
++        $category = array_values(array_filter((array) $category, 'strlen'));
++        $years = array_values(array_unique(array_map('intval', $years)));
++        sort($years);
++        if (!$years)
++            return array(array(), array());
++        $tz = self::userTz();
++        $s = new DateTime('now', $tz); $s->setDate(min($years), 1, 1)->setTime(0, 0, 0);
++        $e = new DateTime('now', $tz); $e->setDate(max($years) + 1, 1, 1)->setTime(0, 0, 0);
++        $rows = self::entries($s, $e, $scope);
++        $tids = array();
++        foreach ($rows as $r) if ((int) $r['ticket_id']) $tids[(int) $r['ticket_id']] = 1;
++        $cats = self::categories(array_keys($tids));
++
++        $labels = $index = array();
++        $mon = array('Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec');
++        foreach ($years as $y) {
++            if ($by === 'month')
++                for ($m = 0; $m < 12; $m++) { $index["$y-$m"] = count($labels); $labels[] = $mon[$m] . ' ' . $y; }
++            elseif ($by === 'quarter')
++                for ($q = 0; $q < 4; $q++) { $index["$y-$q"] = count($labels); $labels[] = 'Q' . ($q + 1) . ' ' . $y; }
++            else { $index["$y-0"] = count($labels); $labels[] = (string) $y; }
++        }
++        $series = array();
++        $total = array_fill(0, count($labels), 0.0);
++        foreach ($rows as $r) {
++            $tid = (int) $r['ticket_id'];
++            $cat = $tid ? (isset($cats[$tid]) ? $cats[$tid] : '(No category)') : '(Standalone tasks)';
++            if ($category && !in_array($cat, $category, true))
++                continue;
++            $d = self::fromDb($r['created']);
++            $y = (int) $d->format('Y');
++            $m = (int) $d->format('n') - 1;
++            $key = $y . '-' . ($by === 'month' ? $m : ($by === 'quarter' ? intdiv($m, 3) : 0));
++            if (!isset($index[$key]))
++                continue;
++            $v = $metric === 'hours' ? ((int) $r['minutes']) / 60 : (float) $r['cost'];
++            if (!isset($series[$cat]))
++                $series[$cat] = array_fill(0, count($labels), 0.0);
++            $series[$cat][$index[$key]] += $v;
++            $total[$index[$key]] += $v;
++        }
++        // Biggest categories first (also keeps colours stable by size)
++        uasort($series, function($a, $b) { return array_sum($b) <=> array_sum($a); });
++        if ($withTotal && count($category) !== 1 && count($series) > 1)
++            $series = array('Total' => $total) + $series;
++        return array($labels, $series);
++    }
++
++    /** Least-squares line through the points: array(slope, intercept) */
++    static function linearFit($vals) {
++        $n = count($vals);
++        if ($n < 2)
++            return null;
++        $sx = $sy = $sxy = $sxx = 0;
++        foreach (array_values($vals) as $i => $v) {
++            $sx += $i; $sy += $v; $sxy += $i * $v; $sxx += $i * $i;
++        }
++        $den = $n * $sxx - $sx * $sx;
++        if (!$den)
++            return null;
++        $b = ($n * $sxy - $sx * $sy) / $den;
++        return array($b, ($sy - $b * $sx) / $n);
++    }
++
++    static $colorMap = array();
++
++    /** Same colour for a category in every chart */
++    static function colorFor($name) {
++        if ($name === 'Total')
++            return '#333';
++        if (!isset(self::$colorMap[$name])) {
++            $p = self::palette();
++            self::$colorMap[$name] = $p[count(self::$colorMap) % count($p)];
++        }
++        return self::$colorMap[$name];
++    }
++
++    static function palette() {
++        return array('#4e79a7', '#f28e2b', '#59a14f', '#e15759', '#76b7b2',
++            '#edc948', '#b07aa1', '#ff9da7', '#9c755f', '#bab0ac');
++    }
++
++    static function fmtValue($v, $metric, $dec=0) {
++        return $metric === 'hours'
++            ? number_format($v, 1) . ' h'
++            : ($v < 0 ? '-' : '') . TimeTrackingPlugin::$opts['currency'] . number_format(abs($v), $dec);
++    }
++
++    /** Multi-series line chart as inline SVG, with optional dashed trend lines */
++    static function svgLines($labels, $series, $metric, $trend) {
++        $colors = self::palette();
++        $W = 900; $H = 340; $L = 70; $R = 20; $Tp = 20; $B = 70;
++        $max = 0; $min = 0;
++        foreach ($series as $vals) foreach ($vals as $v) { $max = max($max, $v); $min = min($min, $v); }
++        $nice = self::niceMax($max ?: 1);
++        $pw = $W - $L - $R; $ph = $H - $Tp - $B;
++        $n = count($labels);
++        $xAt = function($i) use ($L, $pw, $n) { return $L + ($n > 1 ? $pw * $i / ($n - 1) : $pw / 2); };
++        $yAt = function($v) use ($Tp, $ph, $nice) { return $Tp + $ph - $ph * max(0, $v) / $nice; };
++        $h = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
++        $o = sprintf('<svg viewBox="0 0 %d %d" width="100%%" style="max-width:%dpx;font:12px sans-serif" role="img">', $W, $H + 40, $W);
++        for ($i = 0; $i <= 4; $i++) {
++            $v = $nice * $i / 4; $y = $yAt($v);
++            $o .= sprintf('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#e5e5e5"/>', $L, $y, $W - $R, $y);
++            $o .= sprintf('<text x="%d" y="%.1f" text-anchor="end" fill="#666">%s</text>', $L - 6, $y + 4, $h(self::axisLabel($v, $metric, $nice)));
++        }
++        // x labels (thin out when crowded)
++        $step = max(1, (int) ceil($n / 12));
++        foreach ($labels as $i => $lab) {
++            if ($i % $step) continue;
++            $o .= sprintf('<text x="%.1f" y="%d" text-anchor="end" fill="#333" transform="rotate(-35 %.1f %d)">%s</text>',
++                $xAt($i), $Tp + $ph + 16, $xAt($i), $Tp + $ph + 16, $h($lab));
++        }
++        $o .= sprintf('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="#999"/>', $L, $Tp + $ph, $W - $R, $Tp + $ph);
++        $si = 0;
++        foreach ($series as $name => $vals) {
++            $c = self::colorFor($name);
++            $wid = $name === 'Total' ? 3 : 2;
++            $pts = array();
++            foreach ($vals as $i => $v) $pts[] = sprintf('%.1f,%.1f', $xAt($i), $yAt($v));
++            $o .= sprintf('<polyline fill="none" stroke="%s" stroke-width="%d" points="%s"/>', $c, $wid, implode(' ', $pts));
++            foreach ($vals as $i => $v)
++                $o .= sprintf('<circle cx="%.1f" cy="%.1f" r="3" fill="%s"><title>%s %s: %s</title></circle>',
++                    $xAt($i), $yAt($v), $c, $h($name), $h($labels[$i]), $h(self::fmtValue($v, $metric, 2)));
++            if ($trend && ($fit = self::linearFit($vals))) {
++                list($b, $a) = $fit;
++                $o .= sprintf('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="1.5" stroke-dasharray="6 4" opacity="0.8"><title>%s trend: %s per period</title></line>',
++                    $xAt(0), $yAt($a), $xAt($n - 1), $yAt($a + $b * ($n - 1)), $c, $h($name),
++                    $h(($b >= 0 ? '+' : '') . self::fmtValue($b, $metric, 2)));
++            }
++        }
++        // legend (wraps)
++        $lx = $L; $ly = $H + 12; $si = 0;
++        foreach (array_keys($series) as $name) {
++            $c = self::colorFor($name);
++            $w = 30 + 7 * mb_strlen((string) $name);
++            if ($lx + $w > $W - $R) { $lx = $L; $ly += 16; }
++            $o .= sprintf('<rect x="%d" y="%d" width="12" height="4" fill="%s"/><text x="%d" y="%d" fill="#333">%s</text>',
++                $lx, $ly + 4, $c, $lx + 16, $ly + 9, $h($name));
++            $lx += $w;
++        }
++        if ($trend)
++            $o .= sprintf('<text x="%d" y="%d" fill="#888" font-size="11">Dashed lines: linear trend</text>', $W - $R - 150, $Tp - 6);
++        return $o . '</svg>';
++    }
++
++    /**
++     * Two pies for the report period: cost (left) and labor hours (right),
++     * with one shared category legend in the middle. A category has the
++     * same colour in both pies and in the other charts.
++     */
++    static function svgPie($tree) {
++        $rows = array();
++        foreach ($tree as $cat => $c)
++            if ($c['cost'] > 0 || $c['minutes'] > 0)
++                $rows[$cat] = array('cost' => max(0, (float) $c['cost']),
++                    'hours' => max(0, $c['minutes'] / 60));
++        if (!$rows)
++            return '';
++        uasort($rows, function($a, $b) {
++            return array($b['cost'], $b['hours']) <=> array($a['cost'], $a['hours']);
++        });
++        if (count($rows) > 9) {           // keep it readable
++            $top = array_slice($rows, 0, 8, true);
++            $other = array('cost' => 0, 'hours' => 0);
++            foreach (array_slice($rows, 8, null, true) as $r) {
++                $other['cost'] += $r['cost']; $other['hours'] += $r['hours'];
++            }
++            $top['Other'] = $other;
++            $rows = $top;
++        }
++        $sum = array('cost' => 0, 'hours' => 0);
++        foreach ($rows as $r) { $sum['cost'] += $r['cost']; $sum['hours'] += $r['hours']; }
++
++        $h = function($s) { return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8'); };
++        $color = function($cat) { return $cat === 'Other' ? '#bab0ac' : self::colorFor($cat); };
++        $fmt = function($v, $m) {
++            return $m === 'hours' ? number_format($v, 2) . ' h' : self::fmtValue($v, 'cost', 2);
++        };
++        $r = 115; $W = 1120; $cy = 150;
++        $Hgt = max(290, 70 + count($rows) * 22 + 10);
++        $o = sprintf('<svg viewBox="0 0 %d %d" width="100%%" style="max-width:%dpx;font:12px sans-serif" role="img">', $W, $Hgt, $W);
++
++        $pie = function($cx, $m, $title) use ($rows, $sum, $r, $cy, $h, $color, $fmt) {
++            $o = sprintf('<text x="%d" y="18" text-anchor="middle" font-weight="bold" font-size="13" fill="#333">%s</text>', $cx, $h($title));
++            $o .= sprintf('<text x="%d" y="%d" text-anchor="middle" fill="#666">Total %s</text>', $cx, $cy + $r + 22, $h($fmt($sum[$m], $m)));
++            if ($sum[$m] <= 0)
++                return $o . sprintf('<circle cx="%d" cy="%d" r="%d" fill="#eee"/><text x="%d" y="%d" text-anchor="middle" fill="#888">None logged</text>',
++                    $cx, $cy, $r, $cx, $cy + 4);
++            $a0 = -M_PI / 2;
++            foreach ($rows as $cat => $row) {
++                $v = $row[$m];
++                if ($v <= 0) continue;
++                $c = $color($cat);
++                $frac = $v / $sum[$m];
++                $tip = sprintf('%s: %s (%.1f%%)', $cat, $fmt($v, $m), 100 * $frac);
++                if ($frac >= 0.9999) {
++                    $o .= sprintf('<circle cx="%d" cy="%d" r="%d" fill="%s"><title>%s</title></circle>', $cx, $cy, $r, $c, $h($tip));
++                    continue;
++                }
++                $a1 = $a0 + 2 * M_PI * $frac;
++                $o .= sprintf('<path d="M%d,%d L%.2f,%.2f A%d,%d 0 %d 1 %.2f,%.2f Z" fill="%s" stroke="#fff" stroke-width="1"><title>%s</title></path>',
++                    $cx, $cy, $cx + $r * cos($a0), $cy + $r * sin($a0), $r, $r, $frac > 0.5 ? 1 : 0,
++                    $cx + $r * cos($a1), $cy + $r * sin($a1), $c, $h($tip));
++                if ($frac >= 0.05) {
++                    $am = ($a0 + $a1) / 2;
++                    $o .= sprintf('<text x="%.1f" y="%.1f" text-anchor="middle" fill="#fff" font-weight="bold">%d%%</text>',
++                        $cx + 0.65 * $r * cos($am), $cy + 0.65 * $r * sin($am) + 4, round(100 * $frac));
++                }
++                $a0 = $a1;
++            }
++            return $o;
++        };
++        $o .= $pie(135, 'cost', 'Cost');
++        $o .= $pie($W - 135, 'hours', 'Labor (hours)');
++
++        // Shared legend in the middle. Separate right-aligned columns for
++        // each value and its percentage so large numbers never collide:
++        //   Category | Cost  % | Labor  %
++        $lx = 290;                  // swatch; name starts at lx + 20
++        $cV = 600; $cP = 655;       // cost value / % (right edges)
++        $hV = 785; $hP = 840;       // labor value / % (right edges)
++        $o .= sprintf('<text x="%d" y="46" fill="#666" font-weight="bold">Category</text>', $lx)
++            . sprintf('<text x="%d" y="46" text-anchor="end" fill="#666" font-weight="bold">Cost</text>', $cV)
++            . sprintf('<text x="%d" y="46" text-anchor="end" fill="#666" font-weight="bold">%%</text>', $cP)
++            . sprintf('<text x="%d" y="46" text-anchor="end" fill="#666" font-weight="bold">Labor</text>', $hV)
++            . sprintf('<text x="%d" y="46" text-anchor="end" fill="#666" font-weight="bold">%%</text>', $hP)
++            . sprintf('<line x1="%d" y1="52" x2="%d" y2="52" stroke="#ddd"/>', $lx, $hP);
++        $i = 0;
++        foreach ($rows as $cat => $row) {
++            $ly = 60 + $i * 22;
++            $pc = $sum['cost'] > 0 ? 100 * $row['cost'] / $sum['cost'] : 0;
++            $ph = $sum['hours'] > 0 ? 100 * $row['hours'] / $sum['hours'] : 0;
++            $o .= sprintf('<rect x="%d" y="%d" width="14" height="14" fill="%s"/><text x="%d" y="%d" fill="#333"><title>%s</title>%s</text>',
++                    $lx, $ly, $color($cat), $lx + 20, $ly + 12, $h($cat), $h(mb_strimwidth($cat, 0, 28, '…')));
++            foreach (array(
++                    array($cV, $fmt($row['cost'], 'cost'), '#333'),
++                    array($cP, sprintf('%.1f%%', $pc), '#777'),
++                    array($hV, $fmt($row['hours'], 'hours'), '#333'),
++                    array($hP, sprintf('%.1f%%', $ph), '#777')) as $col)
++                $o .= sprintf('<text x="%d" y="%d" text-anchor="end" fill="%s">%s</text>',
++                    $col[0], $ly + 12, $col[2], $h($col[1]));
++            $i++;
++        }
++        return $o . '</svg>';
++    }
++
++    /** Axis label: more decimals for small scales */
++    static function axisLabel($v, $metric, $scaleMax) {
++        $dec = $scaleMax < 10 ? 2 : 0;
++        return $metric === 'hours'
++            ? number_format($v, $scaleMax < 10 ? 2 : 1) . ' h'
++            : self::fmtValue($v, $metric, $dec);
++    }
++
++    static function hasData($series) {
++        foreach ($series as $vals) foreach ($vals as $v) if (abs($v) > 0.000001) return true;
++        return false;
++    }
++
++    static function niceMax($v) {
++        $p = pow(10, floor(log10($v)));
++        foreach (array(1, 2, 2.5, 5, 10) as $m)
++            if ($m * $p >= $v) return $m * $p;
++        return 10 * $p;
++    }
++
++    /* ---------------------------------------------------------------
++     * Export
++     *
++     * Two layouts:
++     *   tickets - one row per ticket (and per standalone task)
++     *   detail  - one row per ticket / task the time was logged on
++     * Excel gets both as two sheets; CSV picks one.
++     * Cost and Hours are the amounts logged in the selected period.
++     * ------------------------------------------------------------- */
++
++    /** column => type: s string, d date, m money, h hours, i integer */
++    static function ticketColumns() {
++        return array(
++            'Ticket Number' => 's', 'Requested By' => 's', 'Requester Email' => 's',
++            'Created Date' => 'd', 'Subject' => 's', 'Category' => 's',
++            'Assigned To' => 's', 'Last Updated' => 'd', 'Status' => 's',
++            'State' => 's', 'Tasks' => 'i', 'Cost' => 'm', 'Hours' => 'h',
++        );
++    }
++
++    static function detailColumns() {
++        return array(
++            'Ticket Number' => 's', 'Requested By' => 's', 'Created Date' => 'd',
++            'Subject' => 's', 'Category' => 's', 'Assigned To' => 's',
++            'Last Updated' => 'd', 'Status' => 's', 'Logged On' => 's',
++            'Task #' => 's', 'Task Title' => 's', 'Task Status' => 's',
++            'Cost' => 'm', 'Hours' => 'h',
++        );
++    }
++
++    /** Ticket columns shared by both layouts */
++    static function ticketFields($cat, $t) {
++        $i = $t['info'];
++        return array(
++            'Ticket Number' => $i['number'], 'Requested By' => $i['requester'],
++            'Requester Email' => $i['email'], 'Created Date' => $i['created'],
++            'Subject' => $i['subject'], 'Category' => $cat,
++            'Assigned To' => $i['assignee'], 'Last Updated' => $i['updated'],
++            'Status' => $i['status'], 'State' => ucfirst($i['state']),
++        );
++    }
++
++    static function ticketRows($tree) {
++        $rows = array();
++        foreach ($tree as $cat => $c) {
++            foreach ($c['tickets'] as $t) {
++                if ($t['id']) {
++                    $rows[] = self::ticketFields($cat, $t) + array(
++                        'Tasks' => count($t['tasks']),
++                        'Cost' => round($t['cost'], 2), 'Hours' => round($t['minutes'] / 60, 2));
++                } else {
++                    // Standalone tasks: one row each
++                    foreach ($t['tasks'] as $k)
++                        $rows[] = array('Ticket Number' => 'Task #' . $k['info']['number'],
++                            'Subject' => $k['info']['title'], 'Category' => $cat,
++                            'Assigned To' => @$k['info']['assignee'],
++                            'Created Date' => @$k['info']['created'],
++                            'Last Updated' => @$k['info']['updated'],
++                            'Status' => $k['info']['status'],
++                            'State' => ucfirst((string) @$k['info']['state']),
++                            'Cost' => round($k['cost'], 2), 'Hours' => round($k['minutes'] / 60, 2));
++                }
++            }
++        }
++        return $rows;
++    }
++
++    static function detailRows($tree) {
++        $rows = array();
++        foreach ($tree as $cat => $c) {
++            foreach ($c['tickets'] as $t) {
++                $base = $t['id'] ? self::ticketFields($cat, $t) : array('Category' => $cat);
++                if ($t['id'] && ($t['own']['minutes'] || $t['own']['cost'] || !$t['tasks']))
++                    $rows[] = $base + array('Logged On' => 'Ticket',
++                        'Cost' => round($t['own']['cost'], 2),
++                        'Hours' => round($t['own']['minutes'] / 60, 2));
++                foreach ($t['tasks'] as $k)
++                    $rows[] = $base + array('Logged On' => 'Task',
++                        'Task #' => $k['info']['number'], 'Task Title' => $k['info']['title'],
++                        'Task Status' => $k['info']['status'],
++                        'Cost' => round($k['cost'], 2), 'Hours' => round($k['minutes'] / 60, 2));
++            }
++        }
++        return $rows;
++    }
++
++    static function fileName($label, $ext, $suffix='') {
++        return 'time-cost-' . trim(preg_replace('/[^A-Za-z0-9]+/', '-', $label), '-')
++            . ($suffix ? '-' . $suffix : '') . '.' . $ext;
++    }
++
++    static function sendCsv($tree, $label, $layout='tickets') {
++        $cols = $layout === 'detail' ? self::detailColumns() : self::ticketColumns();
++        $rows = $layout === 'detail' ? self::detailRows($tree) : self::ticketRows($tree);
++        header('Content-Type: text/csv; charset=UTF-8');
++        header('Content-Disposition: attachment; filename="'
++            . self::fileName($label, 'csv', $layout) . '"');
++        $out = fopen('php://output', 'w');
++        fwrite($out, "\xEF\xBB\xBF");   // UTF-8 BOM for Excel
++        fputcsv($out, array_keys($cols));
++        foreach ($rows as $r) {
++            $line = array();
++            foreach ($cols as $name => $type) {
++                $v = isset($r[$name]) ? $r[$name] : '';
++                if ($type === 'd' && $v instanceof DateTime)
++                    $v = $v->format('Y-m-d H:i');
++                $line[] = self::csvSafe($v);
++            }
++            fputcsv($out, $line);
++        }
++        fclose($out);
++        exit;
++    }
++
++    /** Neutralise spreadsheet formulas in text cells */
++    static function csvSafe($v) {
++        if (is_string($v) && $v !== '' && strpos('=+-@', $v[0]) !== false)
++            return "'" . $v;
++        return $v;
++    }
++
++    static function colName($i) {
++        $s = '';
++        for ($i++; $i > 0; $i = intdiv($i - 1, 26))
++            $s = chr(65 + ($i - 1) % 26) . $s;
++        return $s;
++    }
++
++    /** Worksheet XML for $rows with typed $cols, header + Total row */
++    static function sheetXml($cols, $rows) {
++        $x = function($s) { return htmlspecialchars((string) $s, ENT_XML1 | ENT_QUOTES, 'UTF-8'); };
++        $names = array_keys($cols);
++        $n = count($rows) + 1;               // last data row
++        // style ids: 0 text, 1 bold, 2 money, 3 bold money, 4 hours, 5 bold hours, 6 date
++        $widths = array('s' => 18, 'd' => 17, 'm' => 12, 'h' => 10, 'i' => 8);
++        $wide = array('Subject' => 40, 'Task Title' => 34, 'Requester Email' => 26,
++            'Requested By' => 22, 'Assigned To' => 20, 'Category' => 22);
++        $o = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
++            . '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
++            . '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
++            . '<cols>';
++        foreach ($names as $i => $name)
++            $o .= sprintf('<col min="%d" max="%d" width="%d" customWidth="1"/>', $i + 1, $i + 1,
++                isset($wide[$name]) ? $wide[$name] : $widths[$cols[$name]]);
++        $o .= '</cols><sheetData><row r="1">';
++        foreach ($names as $i => $name)
++            $o .= '<c r="' . self::colName($i) . '1" s="1" t="inlineStr"><is><t>' . $x($name) . '</t></is></c>';
++        $o .= '</row>';
++        foreach ($rows as $ri => $r) {
++            $rn = $ri + 2;
++            $o .= '<row r="' . $rn . '">';
++            foreach ($names as $i => $name) {
++                if (!isset($r[$name]) || $r[$name] === '' || $r[$name] === null)
++                    continue;
++                $v = $r[$name]; $ref = self::colName($i) . $rn; $t = $cols[$name];
++                if ($t === 'd' && $v instanceof DateTime) {
++                    // Excel serial date (local wall-clock time)
++                    $serial = (gmmktime((int) $v->format('H'), (int) $v->format('i'), 0,
++                        (int) $v->format('n'), (int) $v->format('j'), (int) $v->format('Y')) / 86400) + 25569;
++                    $o .= '<c r="' . $ref . '" s="6"><v>' . sprintf('%.10F', $serial) . '</v></c>';
++                } elseif (($t === 'm' || $t === 'h' || $t === 'i') && is_numeric($v)) {
++                    $o .= '<c r="' . $ref . '" s="' . ($t === 'm' ? 2 : ($t === 'h' ? 4 : 0)) . '"><v>' . $v . '</v></c>';
++                } else {
++                    $o .= '<c r="' . $ref . '" t="inlineStr"><is><t>' . $x($v) . '</t></is></c>';
++                }
++            }
++            $o .= '</row>';
++        }
++        // Total row
++        $tr = $n + 1;
++        $o .= '<row r="' . $tr . '"><c r="A' . $tr . '" s="1" t="inlineStr"><is><t>Total</t></is></c>';
++        foreach ($names as $i => $name) {
++            $t = $cols[$name];
++            if ($t !== 'm' && $t !== 'h' && $t !== 'i') continue;
++            $c = self::colName($i);
++            $o .= sprintf('<c r="%s%d" s="%d"><f>SUM(%s2:%s%d)</f></c>', $c, $tr,
++                $t === 'm' ? 3 : ($t === 'h' ? 5 : 1), $c, $c, $n);
++        }
++        $o .= '</row></sheetData>';
++        $o .= '<autoFilter ref="A1:' . self::colName(count($names) - 1) . $n . '"/></worksheet>';
++        return $o;
++    }
++
++    static function sendXlsx($tree, $label) {
++        if (!class_exists('ZipArchive'))
++            return self::sendCsv($tree, $label, 'tickets');
++        $sheets = array(
++            'Tickets' => self::sheetXml(self::ticketColumns(), self::ticketRows($tree)),
++            'Detail'  => self::sheetXml(self::detailColumns(), self::detailRows($tree)),
++        );
++        $styles = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
++            . '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
++            . '<numFmts count="3"><numFmt numFmtId="164" formatCode="#,##0.00"/>'
++            . '<numFmt numFmtId="165" formatCode="0.00"/><numFmt numFmtId="166" formatCode="yyyy-mm-dd hh:mm"/></numFmts>'
++            . '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
++            . '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
++            . '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
++            . '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
++            . '<cellXfs count="7">'
++            . '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
++            . '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
++            . '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
++            . '<xf numFmtId="164" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>'
++            . '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
++            . '<xf numFmtId="165" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>'
++            . '<xf numFmtId="166" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
++            . '</cellXfs>'
++            . '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
++            . '</styleSheet>';
++
++        $ct = $wb = $rels = '';
++        $i = 0;
++        foreach (array_keys($sheets) as $name) {
++            $i++;
++            $ct .= '<Override PartName="/xl/worksheets/sheet' . $i . '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
++            $wb .= '<sheet name="' . $name . '" sheetId="' . $i . '" r:id="rId' . $i . '"/>';
++            $rels .= '<Relationship Id="rId' . $i . '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' . $i . '.xml"/>';
++        }
++        $tmp = tempnam(sys_get_temp_dir(), 'ttx');
++        $z = new ZipArchive();
++        $z->open($tmp, ZipArchive::OVERWRITE);
++        $z->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
++            . '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
++            . '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
++            . '<Default Extension="xml" ContentType="application/xml"/>'
++            . '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
++            . $ct
++            . '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
++            . '</Types>');
++        $z->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
++            . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
++            . '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
++            . '</Relationships>');
++        $z->addFromString('xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
++            . '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
++            . 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
++            . '<sheets>' . $wb . '</sheets></workbook>');
++        $z->addFromString('xl/_rels/workbook.xml.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
++            . '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
++            . $rels
++            . '<Relationship Id="rId' . ($i + 1) . '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
++            . '</Relationships>');
++        $i = 0;
++        foreach ($sheets as $xml)
++            $z->addFromString('xl/worksheets/sheet' . (++$i) . '.xml', $xml);
++        $z->addFromString('xl/styles.xml', $styles);
++        $z->close();
++
++        header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
++        header('Content-Disposition: attachment; filename="' . self::fileName($label, 'xlsx') . '"');
++        header('Content-Length: ' . filesize($tmp));
++        readfile($tmp);
++        @unlink($tmp);
++        exit;
++    }
++
++    /* ---------------------------------------------------------------
++     * Import of hand-entered totals (admins)
++     *
++     * Tickets / tasks whose Time and Cost fields were filled in by hand
++     * (before the plugin, or without posting) have no log rows, so the
++     * reports can't see them. This creates one "opening" row per such
++     * ticket / task from the field values, dated by the chosen basis, and
++     * (optionally) re-dates opening rows created earlier on first use.
++     * ------------------------------------------------------------- */
++
++    /** object_id => array(time value, cost value) from the form fields */
++    static function fieldValues($type, $timeField, $costField) {
++        $P = TABLE_PREFIX;
++        $out = array();
++        $res = db_query(sprintf(
++            "SELECT fe.object_id, LOWER(ff.name) AS name, fv.value
++             FROM `{$P}form_entry` fe
++             JOIN `{$P}form_entry_values` fv ON (fv.entry_id = fe.id)
++             JOIN `{$P}form_field` ff ON (ff.id = fv.field_id)
++             WHERE fe.object_type = %s AND LOWER(ff.name) IN (%s, %s)
++               AND fv.value IS NOT NULL AND TRIM(fv.value) <> ''",
++            db_input($type), db_input($timeField), db_input($costField)));
++        while ($res && ($r = db_fetch_array($res))) {
++            $id = (int) $r['object_id'];
++            if (!isset($out[$id])) $out[$id] = array('', '');
++            $out[$id][$r['name'] === $timeField ? 0 : 1] = trim($r['value']);
++        }
++        return $out;
++    }
++
++    static function importCandidates() {
++        $o = TimeTrackingPlugin::$opts;
++        TimeTrackingPlugin::ensureSchema();
++        $T = TimeTrackingPlugin::table();
++        $has = array('T' => array(), 'A' => array());
++        $res = db_query("SELECT DISTINCT object_type, object_id FROM `$T`");
++        while ($res && ($r = db_fetch_array($res)))
++            $has[$r['object_type']][(int) $r['object_id']] = true;
++        $c = array('T' => array(), 'A' => array());
++        foreach (array('T' => array($o['time_field'], $o['cost_field']),
++                       'A' => array($o['task_time_field'], $o['task_cost_field'])) as $type => $f)
++            foreach (self::fieldValues($type, $f[0], $f[1]) as $id => $v) {
++                if (isset($has[$type][$id]))
++                    continue;
++                // Nothing to import when both are empty / zero
++                $m = TimeTrackingPlugin::parseTime($v[0]);
++                $k = TimeTrackingPlugin::parseCost($v[1]);
++                if (!$m && !$k && $m !== false && $k !== false)
++                    continue;
++                $c[$type][$id] = $v;
++            }
++        // Opening rows still carrying the date they were first imported
++        // (i.e. not matching any of the object's own dates)
++        $P = TABLE_PREFIX;
++        $redate = (int) db_result(db_query(
++            "SELECT COUNT(*) FROM `$T` e
++             LEFT JOIN `{$P}ticket` t ON (e.object_type = 'T' AND t.ticket_id = e.object_id)
++             LEFT JOIN `{$P}task` k ON (e.object_type = 'A' AND k.id = e.object_id)
++             WHERE e.kind = 'opening' AND e.thread_entry_id = 0
++               AND NOT (e.created <=> t.created OR e.created <=> t.closed OR e.created <=> t.lastupdate
++                     OR e.created <=> k.created OR e.created <=> k.closed OR e.created <=> k.updated)
++               AND (t.ticket_id IS NOT NULL OR k.id IS NOT NULL)"));
++        return array($c, $redate);
++    }
++
++    /** SQL expression for the date an object's imported total counts on */
++    static function basisDates($type, $ids, $basis) {
++        $P = TABLE_PREFIX;
++        $out = array();
++        if (!$ids) return $out;
++        $tbl = $type === 'T' ? "`{$P}ticket`" : "`{$P}task`";
++        $pk = $type === 'T' ? 'ticket_id' : 'id';
++        $col = $basis === 'closed' ? 'COALESCE(closed, created)'
++             : ($basis === 'updated' && $type === 'T' ? 'COALESCE(lastupdate, created)'
++             : ($basis === 'updated' ? 'COALESCE(updated, created)' : 'created'));
++        $res = db_query(sprintf("SELECT %s AS id, %s AS d, %s FROM %s WHERE %s IN (%s)",
++            $pk, $col, $type === 'A' ? "IF(object_type = 'T', object_id, 0) AS tid" : "ticket_id AS tid",
++            $tbl, $pk, implode(',', array_map('intval', $ids))));
++        while ($res && ($r = db_fetch_array($res)))
++            $out[(int) $r['id']] = array($r['d'], (int) $r['tid']);
++        return $out;
++    }
++
++    static function runImport($basis, $redate) {
++        list($c, ) = self::importCandidates();
++        $T = TimeTrackingPlugin::table();
++        $stats = array('tickets' => 0, 'tasks' => 0, 'redated' => 0, 'skipped' => array());
++        foreach (array('T', 'A') as $type) {
++            $dates = self::basisDates($type, array_keys($c[$type]), $basis);
++            foreach ($c[$type] as $id => $v) {
++                if (!isset($dates[$id])) continue;          // object deleted
++                $min = TimeTrackingPlugin::parseTime($v[0]);
++                $cost = TimeTrackingPlugin::parseCost($v[1]);
++                if ($min === false || $cost === false) {
++                    $stats['skipped'][] = sprintf('%s %d: "%s" / "%s"',
++                        $type === 'T' ? 'Ticket id' : 'Task id', $id, $v[0], $v[1]);
++                    $min = $min === false ? null : $min;
++                    $cost = $cost === false ? null : $cost;
++                }
++                if (!$min && !$cost) continue;
++                list($d, $tid) = $dates[$id];
++                db_query(sprintf(
++                    "INSERT INTO `%s` (object_type, object_id, ticket_id, thread_entry_id,
++                        staff_id, kind, minutes, cost, created)
++                     VALUES (%s, %d, %d, 0, 0, 'opening', %d, %s, %s)",
++                    $T, db_input($type), $id, $type === 'T' ? $id : $tid,
++                    (int) $min, db_input(sprintf('%.2f', (float) $cost)), db_input($d)));
++                $stats[$type === 'T' ? 'tickets' : 'tasks']++;
++            }
++        }
++        if ($redate) {
++            $P = TABLE_PREFIX;
++            foreach (array('T' => array("`{$P}ticket`", 'ticket_id', 'lastupdate'),
++                           'A' => array("`{$P}task`", 'id', 'updated')) as $type => $m) {
++                list($tbl, $pk, $upd) = $m;
++                $col = $basis === 'closed' ? 'COALESCE(x.closed, x.created)'
++                     : ($basis === 'updated' ? "COALESCE(x.$upd, x.created)" : 'x.created');
++                db_query("UPDATE `$T` e JOIN $tbl x ON (x.$pk = e.object_id)
++                          SET e.created = $col
++                          WHERE e.object_type = '$type' AND e.kind = 'opening'
++                            AND e.thread_entry_id = 0");
++                $stats['redated'] += db_affected_rows();
++            }
++        }
++        return $stats;
++    }
++
++    /* ---------------------------------------------------------------
++     * Page
++     * ------------------------------------------------------------- */
++
++    /** Called from scp/timereports.php after staff.inc.php */
++    static function page() {
++        global $thisstaff, $ost, $nav, $cfg;
++
++        $scope = self::scope($thisstaff);
++        if ($scope === false)
++            Http::response(403, __('Access Denied'));
++
++        $periods = self::periods();
++        $period = isset($periods[@$_GET['period']]) ? $_GET['period'] : 'this_month';
++        list($start, $end, $label) = self::resolve($period, @$_GET['from'], @$_GET['to']);
++        // Admin: import hand-entered totals (POST, CSRF-checked by staff.inc.php)
++        $importMsg = null;
++        if ($thisstaff->isAdmin() && $_SERVER['REQUEST_METHOD'] === 'POST'
++                && @$_POST['tt_import']) {
++            $basis = in_array(@$_POST['basis'], array('created', 'closed', 'updated'))
++                ? $_POST['basis'] : 'closed';
++            $importMsg = self::runImport($basis, !empty($_POST['redate']));
++        }
++        $importInfo = $thisstaff->isAdmin() ? self::importCandidates() : null;
++
++        list($tree, $total) = self::rollup(self::entries($start, $end, $scope));
++
++        if (@$_GET['export'] === 'csv')
++            self::sendCsv($tree, $label, @$_GET['layout'] === 'detail' ? 'detail' : 'tickets');
++        if (@$_GET['export'] === 'xlsx')
++            self::sendXlsx($tree, $label);
++
++        // Comparison
++        $allYears = self::yearsWithData($scope);
++        $nowY = (int) (new DateTime('now', self::userTz()))->format('Y');
++        $years = isset($_GET['years']) && is_array($_GET['years'])
++            ? array_values(array_intersect(array_map('intval', $_GET['years']), $allYears))
++            : array_values(array_intersect(array($nowY, $nowY - 1), $allYears));
++        $by = in_array(@$_GET['by'], array('year', 'quarter', 'month')) ? $_GET['by'] : 'quarter';
++        $metric = @$_GET['metric'] === 'hours' ? 'hours' : 'cost';
++        // Category filter for the comparison chart: one or more names
++        $category = array();
++        foreach ((array) @$_GET['category'] as $c)
++            if (is_string($c) && $c !== '') $category[] = $c;
++        $allCats = array_keys(self::rollup(self::entries(null, null, $scope))[0]);
++        sort($allCats);
++        $category = array_values(array_intersect($category, $allCats));
++        foreach ($allCats as $c)
++            self::colorFor($c);
++        $ctype = @$_GET['ctype'] === 'line' ? 'line' : 'bar';
++        $trend = !empty($_GET['trend']);
++        if ($ctype === 'line') {
++            list($cLabels, $cSeries) = self::compareLines($years, $by, $metric, $category, $scope);
++            $chart = $cSeries ? self::svgLines($cLabels, $cSeries, $metric, $trend) : '';
++        } else {
++            list($cLabels, $cSeries) = self::compare($years, $by, $metric, $category, $scope);
++            $chart = $cSeries ? self::svgChart($cLabels, $cSeries, $metric) : '';
++        }
++        if ($cSeries && !self::hasData($cSeries))
++            $chart = '<p class="faded">No ' . ($metric === 'hours' ? 'hours' : 'cost')
++                . ' logged for the selected years' . ($category ? (count($category) > 1 ? ' in these categories' : ' in this category') : '')
++                . '. Try <em>Show: ' . ($metric === 'hours' ? 'Cost' : 'Hours') . '</em>.</p>';
++        // Pie: on unless switched off (pie=0)
++        $showPie = !isset($_GET['pie']) || $_GET['pie'] !== '0';
++        $pie = $showPie ? self::svgPie($tree) : '';
++
++        $nav->setTabActive('dashboard');
++        require STAFFINC_DIR . 'header.inc.php';
++        include __DIR__ . '/reports.tmpl.php';
++        include STAFFINC_DIR . 'footer.inc.php';
++    }
++}
+diff --git a/include/plugins/time-tracking/reports.tmpl.php b/include/plugins/time-tracking/reports.tmpl.php
+new file mode 100644
+index 0000000..429a7e9
+--- /dev/null
++++ b/include/plugins/time-tracking/reports.tmpl.php
+@@ -0,0 +1,299 @@
++<?php
++// Time & Cost Reports page body. Variables from TimeReports::page().
++if (!defined('OSTSCPINC')) die('Access Denied');
++$h = function($s) { return Format::htmlchars((string) $s); };
++$cur = TimeTrackingPlugin::$opts['currency'];
++$money = function($v) use ($cur) {
++    return ($v < 0 ? '-' : '') . $cur . number_format(abs($v), 2);
++};
++$hours = function($m) { return number_format($m / 60, 2) . ' h'; };
++$qs = function($extra) {
++    $q = array_merge($_GET, $extra);
++    return 'timereports.php?' . Http::build_query($q);
++};
++$catId = 0;
++?>
++<style type="text/css">
++  #ttr h2 { margin: 6px 0 12px; }
++  #ttr form.ttr-filter { background: #f7f7f7; border: 1px solid #ddd; padding: 8px 10px; margin-bottom: 12px; }
++  #ttr form.ttr-filter label { margin-right: 10px; }
++  #ttr .ttr-ms { position: relative; display: inline-block; }
++  #ttr .ttr-ms-btn { min-width: 170px; text-align: left; padding: 3px 8px; background: #fff; border: 1px solid #bbb; border-radius: 3px; cursor: pointer; }
++  #ttr .ttr-ms-list { display: none; position: absolute; z-index: 50; left: 0; top: 100%; margin-top: 2px; background: #fff; border: 1px solid #bbb;
++      box-shadow: 0 3px 8px rgba(0,0,0,.15); max-height: 300px; overflow-y: auto; min-width: 240px; padding: 4px 0; }
++  #ttr .ttr-ms.open .ttr-ms-list { display: block; }
++  #ttr .ttr-ms-list label { display: block; margin: 0; padding: 3px 10px; white-space: nowrap; cursor: pointer; }
++  #ttr .ttr-ms-list label:hover { background: #eef4fa; }
++  #ttr .ttr-ms-tools { padding: 2px 10px 5px; border-bottom: 1px solid #eee; margin-bottom: 3px; font-size: 90%; }
++  #ttr .ttr-totals { margin: 10px 0 14px; }
++  #ttr .ttr-totals span { display: inline-block; margin-right: 24px; font-size: 1.1em; }
++  #ttr .ttr-totals b { font-size: 1.2em; }
++  #ttr table.ttr { width: 100%; border-collapse: collapse; }
++  #ttr table.ttr th, #ttr table.ttr td { padding: 4px 8px; border-bottom: 1px solid #e5e5e5; text-align: left; }
++  #ttr table.ttr th { background: #eee; }
++  #ttr .num { text-align: right !important; white-space: nowrap; }
++  #ttr tr.ttr-cat td { background: #f2f6fa; font-weight: bold; cursor: pointer; }
++  #ttr tr.ttr-ticket td:first-child { padding-left: 26px; }
++  #ttr tr.ttr-ticket.has-tasks td:first-child { cursor: pointer; }
++  #ttr tr.ttr-sub td:first-child { padding-left: 52px; color: #555; }
++  #ttr tr.ttr-total td { font-weight: bold; border-top: 2px solid #bbb; }
++  #ttr .ttr-tog { display: inline-block; width: 14px; color: #888; }
++  #ttr .ttr-compare { margin-top: 24px; border-top: 1px solid #ddd; padding-top: 10px; }
++  #ttr .ttr-pie { margin: 4px 0 16px; }
++  #ttr .ttr-pie h3 { margin: 0 0 6px; }
++  #ttr .ttr-buttons { float: right; }
++  #ttr .ttr-buttons a { margin-left: 6px; }
++</style>
++<div id="ttr">
++<h2><i class="icon-time"></i> <?php echo __('Time & Cost Reports'); ?></h2>
++
++<form method="get" action="timereports.php" class="ttr-filter">
++  <span class="ttr-buttons">
++    <a class="button no-pjax" href="<?php echo $h($qs(array('export' => 'xlsx'))); ?>"
++       title="Workbook with a Tickets sheet and a Detail sheet"><i class="icon-download-alt"></i> Excel (.xlsx)</a>
++    <a class="button no-pjax" href="<?php echo $h($qs(array('export' => 'csv', 'layout' => 'tickets'))); ?>"
++       title="One row per ticket"><i class="icon-download-alt"></i> CSV (tickets)</a>
++    <a class="button no-pjax" href="<?php echo $h($qs(array('export' => 'csv', 'layout' => 'detail'))); ?>"
++       title="One row per ticket / task the time was logged on"><i class="icon-download-alt"></i> CSV (detail)</a>
++  </span>
++  <label><strong>Period:</strong>
++    <select name="period" id="ttr-period">
++      <?php foreach ($periods as $k => $v) { ?>
++      <option value="<?php echo $k; ?>" <?php if ($k === $period) echo 'selected="selected"'; ?>><?php echo $h($v); ?></option>
++      <?php } ?>
++    </select></label>
++  <span id="ttr-custom" style="<?php if ($period !== 'custom') echo 'display:none'; ?>">
++    <label>From <input type="date" name="from" value="<?php echo $h(@$_GET['from']); ?>"></label>
++    <label>To <input type="date" name="to" value="<?php echo $h(@$_GET['to']); ?>"></label>
++  </span>
++  <?php foreach (array('by', 'metric', 'ctype', 'trend') as $k) if (isset($_GET[$k]) && is_string($_GET[$k])) { ?>
++    <input type="hidden" name="<?php echo $k; ?>" value="<?php echo $h($_GET[$k]); ?>">
++  <?php } foreach ($category as $c) { ?>
++    <input type="hidden" name="category[]" value="<?php echo $h($c); ?>">
++  <?php } foreach ((array) @$_GET['years'] as $y) { ?>
++    <input type="hidden" name="years[]" value="<?php echo (int) $y; ?>">
++  <?php } ?>
++  <input type="hidden" name="pie" value="0">
++  <label><input type="checkbox" name="pie" value="1" <?php if ($showPie) echo 'checked="checked"'; ?>> Pie charts</label>
++  <input type="submit" value="Run report">
++  <div class="faded" style="margin-top:4px"><?php echo $h($label); ?>
++    &mdash; counted by the date time/cost was logged<?php
++    if (is_array($scope)) echo ' &mdash; departments you manage'; ?></div>
++</form>
++
++<?php if ($importMsg) { ?>
++<div id="msg_notice" style="margin-bottom:10px">
++  Imported totals for <?php echo (int) $importMsg['tickets']; ?> ticket(s) and
++  <?php echo (int) $importMsg['tasks']; ?> task(s)<?php
++  if ($importMsg['redated']) echo '; re-dated ' . (int) $importMsg['redated'] . ' opening balance(s)'; ?>.
++  <?php if ($importMsg['skipped']) { ?>
++  <br>Values that could not be read (left out): <?php echo $h(implode('; ', array_slice($importMsg['skipped'], 0, 20)));
++     if (count($importMsg['skipped']) > 20) echo ' &hellip; and ' . (count($importMsg['skipped']) - 20) . ' more'; ?>
++  <?php } ?>
++</div>
++<?php }
++if ($importInfo) {
++  list($cand, $redateCount) = $importInfo;
++  $nT = count($cand['T']); $nA = count($cand['A']);
++  if ($nT || $nA || $redateCount) { ?>
++<form method="post" action="<?php echo $h('timereports.php?' . Http::build_query($_GET)); ?>" class="ttr-filter" style="background:#fff8e5;border-color:#e8c66b">
++  <?php csrf_token(); ?>
++  <input type="hidden" name="tt_import" value="1">
++  <strong><i class="icon-warning-sign"></i> Totals typed in by hand:</strong>
++  <?php if ($nT || $nA) { ?>
++    <?php echo $nT; ?> ticket(s) and <?php echo $nA; ?> task(s) have Time/Cost values in their fields
++    but no logged entries, so the reports can't see them.
++  <?php } else { ?>
++    All typed-in totals are imported.
++  <?php } ?>
++  <?php if ($redateCount) { ?>
++    <?php echo (int) $redateCount; ?> earlier imported (opening) total(s) are dated when they were first imported.
++  <?php } ?>
++  <div style="margin-top:6px">
++    <label>Count them on:
++      <select name="basis">
++        <option value="closed">Closed date (created date if still open)</option>
++        <option value="created">Created date</option>
++        <option value="updated">Last updated date</option>
++      </select></label>
++    <?php if ($redateCount) { ?>
++    <label><input type="checkbox" name="redate" value="1" checked="checked"> Re-date existing opening totals the same way</label>
++    <?php } ?>
++    <input type="submit" value="Import" onclick="return confirm('Create log entries from the typed-in Time/Cost values?');">
++    <span class="faded">Admins only. Totals shown on tickets don't change.</span>
++  </div>
++</form>
++<?php }
++} ?>
++
++<div class="ttr-totals">
++  <span>Total cost <b><?php echo $money($total['cost']); ?></b></span>
++  <span>Total time <b><?php echo $hours($total['minutes']); ?></b></span>
++  <span>Tickets <b><?php echo (int) $total['tickets']; ?></b></span>
++  <span>Tasks <b><?php echo (int) $total['tasks']; ?></b></span>
++</div>
++
++<?php if ($pie) { ?>
++<div class="ttr-pie">
++  <h3><i class="icon-adjust"></i> Cost and labor by category &mdash; <?php echo $h($label); ?></h3>
++  <?php echo $pie; ?>
++</div>
++<?php } ?>
++
++<?php if (!$tree) { ?>
++  <p class="faded">No time or cost was logged in this period.</p>
++<?php } else { ?>
++<p class="faded" style="margin:0 0 4px">
++  <a href="#" id="ttr-expand">Expand all</a> &middot; <a href="#" id="ttr-collapse">Collapse all</a>
++</p>
++<table class="ttr">
++  <thead><tr>
++    <th>Category / Ticket / Task</th><th>Status</th>
++    <th class="num">Tickets</th><th class="num">Time</th><th class="num">Cost</th><th class="num">% of cost</th>
++  </tr></thead>
++  <tbody>
++  <?php foreach ($tree as $cat => $c) { $catId++; ?>
++    <tr class="ttr-cat" data-cat="<?php echo $catId; ?>">
++      <td><span class="ttr-tog">&#9656;</span> <?php echo $h($cat); ?></td><td></td>
++      <td class="num"><?php echo count(array_filter($c['tickets'], function($t) { return $t['id']; })); ?></td>
++      <td class="num"><?php echo $hours($c['minutes']); ?></td>
++      <td class="num"><?php echo $money($c['cost']); ?></td>
++      <td class="num"><?php echo $total['cost'] ? number_format(100 * $c['cost'] / $total['cost'], 1) . '%' : ''; ?></td>
++    </tr>
++    <?php foreach ($c['tickets'] as $tk => $t) {
++      $tkId = $catId . '-' . $h($tk); ?>
++    <tr class="ttr-ticket <?php if ($t['tasks']) echo 'has-tasks'; ?>" data-in="<?php echo $catId; ?>"
++        data-ticket="<?php echo $tkId; ?>" style="display:none">
++      <td><?php if ($t['tasks']) echo '<span class="ttr-tog">&#9656;</span> ';
++        if ($t['id']) { ?>
++        <a href="tickets.php?id=<?php echo (int) $t['id']; ?>">#<?php echo $h($t['info']['number']); ?></a>
++        <?php echo $h($t['info']['subject']);
++        } else echo 'Tasks not linked to a ticket'; ?></td>
++      <td><?php echo $h($t['info']['status']); ?></td><td></td>
++      <td class="num"><?php echo $hours($t['minutes']); ?></td>
++      <td class="num"><?php echo $money($t['cost']); ?></td><td></td>
++    </tr>
++      <?php if ($t['tasks']) { ?>
++        <?php if ($t['id']) { ?>
++    <tr class="ttr-sub" data-in-ticket="<?php echo $tkId; ?>" style="display:none">
++      <td>Ticket itself</td><td></td><td></td>
++      <td class="num"><?php echo $hours($t['own']['minutes']); ?></td>
++      <td class="num"><?php echo $money($t['own']['cost']); ?></td><td></td>
++    </tr>
++        <?php } foreach ($t['tasks'] as $k) { ?>
++    <tr class="ttr-sub" data-in-ticket="<?php echo $tkId; ?>" style="display:none">
++      <td><a href="tasks.php?id=<?php echo (int) $k['id']; ?>">Task #<?php echo $h($k['info']['number']); ?></a>
++        <?php echo $h($k['info']['title']); ?></td>
++      <td><?php echo $h($k['info']['status']); ?></td><td></td>
++      <td class="num"><?php echo $hours($k['minutes']); ?></td>
++      <td class="num"><?php echo $money($k['cost']); ?></td><td></td>
++    </tr>
++        <?php } ?>
++      <?php } ?>
++    <?php } ?>
++  <?php } ?>
++    <tr class="ttr-total"><td>Total</td><td></td>
++      <td class="num"><?php echo (int) $total['tickets']; ?></td>
++      <td class="num"><?php echo $hours($total['minutes']); ?></td>
++      <td class="num"><?php echo $money($total['cost']); ?></td><td class="num">100%</td></tr>
++  </tbody>
++</table>
++<?php } ?>
++
++<div class="ttr-compare">
++  <h3><i class="icon-bar-chart"></i> Year over year</h3>
++  <form method="get" action="timereports.php" class="ttr-filter">
++    <?php foreach (array('period', 'from', 'to', 'pie') as $k) if (isset($_GET[$k])) { ?>
++      <input type="hidden" name="<?php echo $k; ?>" value="<?php echo $h($_GET[$k]); ?>">
++    <?php } ?>
++    <strong>Years:</strong>
++    <?php if (!$allYears) echo '<span class="faded">no data yet</span>';
++      foreach ($allYears as $y) { ?>
++      <label><input type="checkbox" name="years[]" value="<?php echo $y; ?>"
++        <?php if (in_array($y, $years)) echo 'checked="checked"'; ?>> <?php echo $y; ?></label>
++    <?php } ?>
++    &nbsp; <strong>By:</strong>
++    <?php foreach (array('year' => 'Year', 'quarter' => 'Quarter', 'month' => 'Month') as $k => $v) { ?>
++      <label><input type="radio" name="by" value="<?php echo $k; ?>" <?php if ($by === $k) echo 'checked="checked"'; ?>> <?php echo $v; ?></label>
++    <?php } ?>
++    &nbsp; <strong>Show:</strong>
++    <label><input type="radio" name="metric" value="cost" <?php if ($metric === 'cost') echo 'checked="checked"'; ?>> Cost</label>
++    <label><input type="radio" name="metric" value="hours" <?php if ($metric === 'hours') echo 'checked="checked"'; ?>> Hours</label>
++    &nbsp; <strong>Category:</strong>
++    <span class="ttr-ms" id="ttr-cats">
++      <button type="button" class="ttr-ms-btn"><span class="ttr-ms-lbl"><?php
++        echo $category ? $h(count($category) === 1 ? $category[0] : count($category) . ' categories') : 'All categories';
++      ?></span> &#9662;</button>
++      <div class="ttr-ms-list">
++        <div class="ttr-ms-tools"><a href="#" data-ms="all">Select all</a> &middot; <a href="#" data-ms="none">Clear</a></div>
++        <?php foreach ($allCats as $c) { ?>
++        <label><input type="checkbox" name="category[]" value="<?php echo $h($c); ?>"
++          <?php if (in_array($c, $category, true)) echo 'checked="checked"'; ?>> <?php echo $h($c); ?></label>
++        <?php } ?>
++      </div>
++    </span>
++    <div style="margin-top:6px">
++    <strong>Chart:</strong>
++    <label><input type="radio" name="ctype" value="bar" <?php if ($ctype === 'bar') echo 'checked="checked"'; ?>> Bars (years side by side)</label>
++    <label><input type="radio" name="ctype" value="line" <?php if ($ctype === 'line') echo 'checked="checked"'; ?>> Lines (one per category, over time)</label>
++    &nbsp; <label id="ttr-trend" style="<?php if ($ctype !== 'line') echo 'opacity:.5'; ?>">
++      <input type="checkbox" name="trend" value="1" <?php if ($trend) echo 'checked="checked"'; ?>> Trend line</label>
++    &nbsp; <input type="submit" value="Update chart">
++    </div>
++  </form>
++  <?php if ($chart) echo $chart;
++        elseif ($allYears) echo '<p class="faded">Select one or more years.</p>'; ?>
++</div>
++</div>
++
++<script type="text/javascript">
++(function($) {
++  $('#ttr-period').on('change', function() { $('#ttr-custom').toggle(this.value === 'custom'); });
++  // Category multi-select (comparison chart)
++  var $ms = $('#ttr-cats');
++  function msLabel() {
++    var $c = $ms.find('input:checked');
++    $ms.find('.ttr-ms-lbl').text(!$c.length ? 'All categories'
++      : $c.length === 1 ? $.trim($c.parent().text()) : $c.length + ' categories');
++  }
++  $ms.on('click', '.ttr-ms-btn', function(e) { e.preventDefault(); $ms.toggleClass('open'); });
++  $ms.on('change', 'input', msLabel);
++  $ms.on('click', 'a[data-ms]', function(e) {
++    e.preventDefault();
++    $ms.find('input').prop('checked', $(this).data('ms') === 'all');
++    msLabel();
++  });
++  $(document).on('click.ttrms', function(e) { if (!$(e.target).closest('#ttr-cats').length) $ms.removeClass('open'); });
++  $('input[name=ctype]').on('change', function() {
++    $('#ttr-trend').css('opacity', $('input[name=ctype]:checked').val() === 'line' ? 1 : .5);
++  });
++  function setCat($row, open) {
++    var id = $row.data('cat');
++    $row.find('.ttr-tog').first().html(open ? '&#9662;' : '&#9656;');
++    var $t = $('tr[data-in="' + id + '"]').toggle(open);
++    if (!open) $t.each(function() { setTicket($(this), false); });
++  }
++  function setTicket($row, open) {
++    if (!$row.hasClass('has-tasks')) return;
++    $row.find('.ttr-tog').first().html(open ? '&#9662;' : '&#9656;');
++    $('tr[data-in-ticket="' + $row.data('ticket') + '"]').toggle(open);
++  }
++  $(document).off('.ttr');
++  $(document).on('click.ttr', '#ttr tr.ttr-cat', function() {
++    setCat($(this), $(this).find('.ttr-tog').html() !== '▾');
++  });
++  $(document).on('click.ttr', '#ttr tr.ttr-ticket.has-tasks', function(e) {
++    if ($(e.target).is('a')) return;
++    setTicket($(this), $(this).find('.ttr-tog').html() !== '▾');
++  });
++  $(document).on('click.ttr', '#ttr-expand', function(e) {
++    e.preventDefault();
++    $('#ttr tr.ttr-cat').each(function() { setCat($(this), true); });
++    $('#ttr tr.ttr-ticket').each(function() { setTicket($(this), true); });
++  });
++  $(document).on('click.ttr', '#ttr-collapse', function(e) {
++    e.preventDefault();
++    $('#ttr tr.ttr-cat').each(function() { setCat($(this), false); });
++  });
++})(jQuery);
++</script>
 diff --git a/include/plugins/time-tracking/timetracking.php b/include/plugins/time-tracking/timetracking.php
 new file mode 100644
-index 0000000..3ce6f7b
+index 0000000..841b221
 --- /dev/null
 +++ b/include/plugins/time-tracking/timetracking.php
-@@ -0,0 +1,454 @@
+@@ -0,0 +1,457 @@
 +<?php
 +/*********************************************************************
 + * Time & Cost Tracking plugin for osTicket 1.17 / 1.18
@@ -1498,6 +3033,7 @@ index 0000000..3ce6f7b
 +require_once INCLUDE_DIR . 'class.plugin.php';
 +require_once INCLUDE_DIR . 'class.signal.php';
 +require_once __DIR__ . '/config.php';
++require_once __DIR__ . '/reports.php';
 +
 +class TimeTrackingPlugin extends Plugin {
 +    var $config_class = 'TimeTrackingConfig';
@@ -1534,6 +3070,8 @@ index 0000000..3ce6f7b
 +            'time_format' => $fmt === 'hm' ? 'hm' : 'decimal',
 +            'currency' => (string) $c->get('currency', '$'),
 +            'timer' => (bool) $c->get('timer', true),
++            'reports' => (bool) $c->get('reports', true),
++            'category_field' => mb_strtolower(trim($c->get('category_field') ?: 'category')),
 +            'timer_round' => $round,
 +        );
 +
@@ -2392,3 +3930,23 @@ index 11a430a..053245a 100644
          }
      }
  
+diff --git a/scp/timereports.php b/scp/timereports.php
+new file mode 100644
+index 0000000..258928a
+--- /dev/null
++++ b/scp/timereports.php
+@@ -0,0 +1,14 @@
++<?php
++/*********************************************************************
++    timereports.php
++
++    Time & Cost Reports (provided by the Time & Cost Tracking plugin)
++**********************************************************************/
++require('staff.inc.php');
++
++if (!class_exists('TimeReports', false) || !TimeReports::canView($thisstaff)) {
++    Http::response(404, __('Not found'));
++    exit;
++}
++TimeReports::page();
++?>
