@@ -1,12 +1,14 @@
 diff --git a/include/class.nav.php b/include/class.nav.php
-index d0f14b0..20e5822 100644
+index d0f14b0..eecd4bf 100644
 --- a/include/class.nav.php
 +++ b/include/class.nav.php
-@@ -161,6 +161,9 @@ class StaffNav {
+@@ -161,6 +161,11 @@ class StaffNav {
                      $subnav[]=array('desc'=>__('Dashboard'),'href'=>'dashboard.php','iconclass'=>'logs');
                      $subnav[]=array('desc'=>__('Agent Directory'),'href'=>'directory.php','iconclass'=>'teams');
                      $subnav[]=array('desc'=>__('My Profile'),'href'=>'profile.php','iconclass'=>'users');
-+                    // Time & Cost Reports (Time & Cost Tracking plugin)
++                    // My Time + Time & Cost Reports (Time & Cost Tracking plugin)
++                    if (class_exists('AgentTimeReport', false) && AgentTimeReport::canView($staff))
++                        $subnav[]=array('desc'=>__('My Time'),'href'=>'mytime.php','iconclass'=>'logs');
 +                    if (class_exists('TimeReports', false) && TimeReports::canView($staff))
 +                        $subnav[]=array('desc'=>__('Time & Cost Reports'),'href'=>'timereports.php','iconclass'=>'logs');
                      break;
@@ -55,10 +57,22 @@ index 829115f..fff648e 100755
          }
          return $Q;
 diff --git a/include/class.task.php b/include/class.task.php
-index 4c4363a..8ba1c31 100644
+index 4c4363a..c7a9a62 100644
 --- a/include/class.task.php
 +++ b/include/class.task.php
-@@ -269,7 +269,11 @@ class Task extends TaskModel implements RestrictedAccess, Threadable {
+@@ -193,6 +193,11 @@ class TaskModel extends VerySimpleModel {
+                     '', '');
+         }
+ 
++        // Plugins (e.g. Sub-tasks) may veto closing with a warning
++        $data = array('warning' => $warning);
++        Signal::send('task.closeable', $this, $data);
++        $warning = $data['warning'];
++
+         return $warning ?: true;
+     }
+ 
+@@ -269,7 +274,11 @@ class Task extends TaskModel implements RestrictedAccess, Threadable {
      }
  
      function getStatus() {
@@ -409,6 +423,825 @@ index 0000000..d55a185
 +        $data['handled'] = true;
 +    }
 +}
+diff --git a/include/plugins/sub-tasks/config.php b/include/plugins/sub-tasks/config.php
+new file mode 100644
+index 0000000..f3e87e6
+--- /dev/null
++++ b/include/plugins/sub-tasks/config.php
+@@ -0,0 +1,33 @@
++<?php
++require_once INCLUDE_DIR . 'class.plugin.php';
++require_once INCLUDE_DIR . 'class.forms.php';
++
++/*
++ * The recommended behaviour is with every box unticked: osTicket saves
++ * ticked-by-default checkboxes as unticked when an instance is first added.
++ */
++class SubTasksConfig extends PluginConfig {
++
++    function getOptions() {
++        return array(
++            'allow_close' => new BooleanField(array(
++                'label' => 'Completing a parent',
++                'default' => false,
++                'configuration' => array('desc' =>
++                    'Allow a task to be completed while some of its sub-tasks are still open'),
++            )),
++            'no_reopen' => new BooleanField(array(
++                'label' => 'Reopening',
++                'default' => false,
++                'configuration' => array('desc' =>
++                    'Don\'t reopen a completed parent when one of its sub-tasks is reopened or added'),
++            )),
++            'any_dept' => new BooleanField(array(
++                'label' => 'Department',
++                'default' => false,
++                'configuration' => array('desc' =>
++                    'Don\'t preselect the parent task\'s department for new sub-tasks'),
++            )),
++        );
++    }
++}
+diff --git a/include/plugins/sub-tasks/plugin.php b/include/plugins/sub-tasks/plugin.php
+new file mode 100644
+index 0000000..0172899
+--- /dev/null
++++ b/include/plugins/sub-tasks/plugin.php
+@@ -0,0 +1,14 @@
++<?php
++
++return array(
++    'id' =>             'community:sub-tasks', # notrans
++    'version' =>        '1.0.0',
++    'ost_version' =>    '1.17',
++    'name' =>           /* trans */ 'Sub-tasks',
++    'author' =>         'Community contributors',
++    'description' =>    /* trans */ 'Lets a task have sub-tasks (one level).
++        Sub-tasks are ordinary tasks on the same ticket; the plugin only
++        records which task they belong under. Disable the plugin and they
++        show as a flat list again.',
++    'plugin' =>         'subtasks.php:SubTasksPlugin',
++);
+diff --git a/include/plugins/sub-tasks/subtasks.php b/include/plugins/sub-tasks/subtasks.php
+new file mode 100644
+index 0000000..0ab735e
+--- /dev/null
++++ b/include/plugins/sub-tasks/subtasks.php
+@@ -0,0 +1,460 @@
++<?php
++/*********************************************************************
++ * Sub-tasks plugin for osTicket 1.17 / 1.18
++ *
++ * A sub-task is an ordinary osTicket task on the same ticket (or a
++ * standalone task under a standalone task). The plugin only records which
++ * task it sits under, in %TABLE_PREFIX%task_subtask:
++ *
++ *   task_id    the sub-task
++ *   parent_id  the task it belongs under
++ *
++ * One level only: a sub-task cannot have sub-tasks of its own.
++ *
++ *  - Task view: a Sub-tasks panel (status, assignee, time / cost when the
++ *    Time & Cost plugin is active) with an "Add Sub-task" button, and a
++ *    "Sub-task of" line on each sub-task.
++ *  - Ticket: sub-tasks are listed under their parent on the Tasks tab and
++ *    in the Time & Cost summary.
++ *  - An existing task can be moved under another task ("Make this a
++ *    sub-task of..."), moved to another parent, or made top-level again.
++ *  - A parent cannot be completed while sub-tasks are open; reopening a
++ *    sub-task reopens a completed parent (both optional).
++ *
++ * Nothing else is stored, and osTicket's own tables are not changed.
++ * Disabling the plugin shows sub-tasks as a flat list of tasks again;
++ * DROP TABLE %TABLE_PREFIX%task_subtask removes the links for good.
++ *********************************************************************/
++
++require_once INCLUDE_DIR . 'class.plugin.php';
++require_once INCLUDE_DIR . 'class.signal.php';
++require_once __DIR__ . '/config.php';
++
++class SubTasksPlugin extends Plugin {
++    var $config_class = 'SubTasksConfig';
++
++    static $opts = null;
++    static $schemaOk = false;
++    static $parentCache = array();
++    static $reopening = false;
++
++    function isMultiInstance() {
++        return false;
++    }
++
++    function bootstrap() {
++        $c = $this->getConfig();
++        self::$opts = array(
++            'block_close' => !$c->get('allow_close'),
++            'reopen_parent' => !$c->get('no_reopen'),
++            'same_dept' => !$c->get('any_dept'),
++        );
++        Signal::connect('task.created', array(__CLASS__, 'onTaskCreated'));
++        Signal::connect('task.closeable', array(__CLASS__, 'onCloseable'));
++        Signal::connect('model.updated', array(__CLASS__, 'onTaskUpdated'), 'Task');
++        Signal::connect('model.deleted', array(__CLASS__, 'onTaskDeleted'), 'Task');
++        Signal::connect('object.view', array(__CLASS__, 'onTaskView'), 'Task');
++        Signal::connect('object.view', array(__CLASS__, 'onTicketView'), 'Ticket');
++        Signal::connect('ajax.scp', function($dispatcher) {
++            $dispatcher->append(url_post('^/subtasks/(?P<id>\d+)/parent$',
++                function($id) { SubTasksPlugin::ajaxSetParent($id); }));
++        });
++    }
++
++    /** True when the plugin is enabled (for other plugins) */
++    static function active() {
++        return self::$opts !== null && self::ensureSchema();
++    }
++
++    /* ---------------------------------------------------------------
++     * Storage
++     * ------------------------------------------------------------- */
++
++    static function table() {
++        return TABLE_PREFIX . 'task_subtask';
++    }
++
++    static function ensureSchema() {
++        if (self::$schemaOk)
++            return true;
++        return self::$schemaOk = (bool) db_query('CREATE TABLE IF NOT EXISTS `'
++            . self::table() . '` (
++              `task_id` int(11) unsigned NOT NULL,
++              `parent_id` int(11) unsigned NOT NULL,
++              `created` datetime NOT NULL,
++              PRIMARY KEY (`task_id`),
++              KEY `parent_id` (`parent_id`)
++            ) DEFAULT CHARSET=utf8');
++    }
++
++    /** Parent task id of a sub-task, or 0 */
++    static function parentOf($taskId) {
++        $taskId = (int) $taskId;
++        if (!array_key_exists($taskId, self::$parentCache)) {
++            self::$parentCache[$taskId] = 0;
++            if (self::ensureSchema()
++                    && ($res = db_query(sprintf('SELECT parent_id FROM `%s` WHERE task_id=%d',
++                        self::table(), $taskId)))
++                    && ($row = db_fetch_array($res)))
++                self::$parentCache[$taskId] = (int) $row['parent_id'];
++        }
++        return self::$parentCache[$taskId];
++    }
++
++    /** Sub-task ids of a task, oldest first */
++    static function childIds($parentId) {
++        $ids = array();
++        if (self::ensureSchema()
++                && ($res = db_query(sprintf('SELECT task_id FROM `%s` WHERE parent_id=%d ORDER BY task_id',
++                    self::table(), $parentId))))
++            while ($row = db_fetch_array($res))
++                $ids[] = (int) $row['task_id'];
++        return $ids;
++    }
++
++    static function children($parentId) {
++        $ids = self::childIds($parentId);
++        if (!$ids)
++            return array();
++        return Task::objects()->filter(array('id__in' => $ids))->order_by('id')->all();
++    }
++
++    /** array(child id => parent id) for the given task ids */
++    static function parentMap($ids) {
++        $ids = array_filter(array_map('intval', (array) $ids));
++        $map = array();
++        if (!$ids || !self::ensureSchema())
++            return $map;
++        $res = db_query(sprintf('SELECT task_id, parent_id FROM `%s` WHERE task_id IN (%s)',
++            self::table(), implode(',', $ids)));
++        while ($res && ($row = db_fetch_array($res)))
++            $map[(int) $row['task_id']] = (int) $row['parent_id'];
++        return $map;
++    }
++
++    /**
++     * Order task ids so each sub-task follows its parent. Returns
++     * array(id => parent id or 0). Sub-tasks whose parent isn't in the
++     * list are shown as top-level.
++     */
++    static function order($ids) {
++        $ids = array_values(array_map('intval', (array) $ids));
++        $map = self::parentMap($ids);
++        $in = array_flip($ids);
++        $kids = array();
++        foreach ($ids as $id)
++            if (isset($map[$id]) && isset($in[$map[$id]]))
++                $kids[$map[$id]][] = $id;
++        $out = array();
++        foreach ($ids as $id) {
++            if (isset($map[$id]) && isset($in[$map[$id]]))
++                continue;
++            $out[$id] = 0;
++            foreach ((array) @$kids[$id] as $k)
++                $out[$k] = $id;
++        }
++        return $out;
++    }
++
++    static function link($taskId, $parentId) {
++        if (!self::ensureSchema())
++            return false;
++        self::$parentCache[(int) $taskId] = (int) $parentId;
++        return db_query(sprintf(
++            'INSERT INTO `%s` (task_id, parent_id, created) VALUES (%d, %d, NOW())
++             ON DUPLICATE KEY UPDATE parent_id=VALUES(parent_id)',
++            self::table(), $taskId, $parentId));
++    }
++
++    static function unlink($taskId) {
++        if (!self::ensureSchema())
++            return false;
++        self::$parentCache[(int) $taskId] = 0;
++        return db_query(sprintf('DELETE FROM `%s` WHERE task_id=%d', self::table(), $taskId));
++    }
++
++    /** Same ticket, or both standalone */
++    static function sameContainer($a, $b) {
++        return (string) $a->object_type === (string) $b->object_type
++            && (int) $a->object_id === (int) $b->object_id;
++    }
++
++    /** Tasks a new sub-task may be placed under (open, top-level, same container) */
++    static function eligibleParents($task) {
++        $list = array();
++        if ($task->object_type === ObjectModel::OBJECT_TYPE_TICKET && $task->object_id) {
++            $tasks = Task::objects()->filter(array(
++                'object_type' => ObjectModel::OBJECT_TYPE_TICKET,
++                'object_id' => $task->object_id))->order_by('id')->all();
++            $map = self::parentMap(array_map(function($t) { return $t->getId(); }, $tasks));
++            foreach ($tasks as $t)
++                if ($t->isOpen() && !isset($map[$t->getId()]))
++                    $list[] = $t;
++        }
++        else
++            $list[] = $task;
++        return $list;
++    }
++
++    static function canAddTo($task) {
++        global $thisstaff;
++        if (!$thisstaff || self::parentOf($task->getId()))
++            return false;
++        if ($task->object_type === ObjectModel::OBJECT_TYPE_TICKET && $task->object_id) {
++            $ticket = Ticket::lookup($task->object_id);
++            return $ticket && $ticket->checkStaffPerm($thisstaff, Task::PERM_CREATE);
++        }
++        $role = $thisstaff->getRole($task->getDept());
++        return $role && $role->hasPerm(Task::PERM_CREATE);
++    }
++
++    /** Why $task can't go under $parent, or null if it can */
++    static function checkParent($task, $parent) {
++        global $thisstaff;
++        if (!$parent)
++            return 'Parent task not found';
++        if ($parent->getId() == $task->getId())
++            return 'A task cannot be its own sub-task';
++        if (self::parentOf($parent->getId()))
++            return sprintf('Task #%s is itself a sub-task (one level only)', $parent->getNumber());
++        if (self::childIds($task->getId()))
++            return sprintf('Task #%s has sub-tasks of its own (one level only)', $task->getNumber());
++        if (!self::sameContainer($parent, $task))
++            return 'The parent belongs to a different ticket';
++        if ($thisstaff && !$parent->checkStaffPerm($thisstaff))
++            return 'No access to the parent task';
++        return null;
++    }
++
++    /** Note on the parent's thread, without alerts */
++    static function noteOnParent($parent, $task, $title) {
++        global $thisstaff;
++        $errors = array();
++        $parent->postNote(array(
++            'title' => sprintf($title, $task->getNumber()),
++            'note' => sprintf('<a href="tasks.php?id=%d"><b>#%s</b></a> &mdash; %s',
++                $task->getId(), $task->getNumber(), Format::htmlchars($task->getTitle())),
++        ), $errors, $thisstaff, false);
++    }
++
++    /** POST ajax.php/subtasks/{id}/parent  parent=<task id> (empty = top-level) */
++    static function ajaxSetParent($id) {
++        global $thisstaff;
++        if (!$thisstaff)
++            Http::response(403, 'Login required');
++        if (!($task = Task::lookup((int) $id)) || !$task->checkStaffPerm($thisstaff))
++            Http::response(404, 'No such task');
++        if (!$task->checkStaffPerm($thisstaff, Task::PERM_EDIT))
++            Http::response(403, 'You do not have permission to edit this task');
++        if (!self::ensureSchema())
++            Http::response(500, 'Unable to save');
++
++        $old = self::parentOf($task->getId());
++        $pid = (int) @$_POST['parent'];
++        if ($pid && $pid !== $old) {
++            $parent = Task::lookup($pid);
++            if ($why = self::checkParent($task, $parent))
++                Http::response(422, Format::htmlchars($why));
++            self::link($task->getId(), $pid);
++            if ($old && ($o = Task::lookup($old)))
++                self::noteOnParent($o, $task, __('Sub-task #%s moved to another task'));
++            self::noteOnParent($parent, $task, __('Sub-task #%s added'));
++            if (self::$opts['reopen_parent'] && $parent->isClosed() && $task->isOpen())
++                self::reopen($parent);
++        }
++        elseif (!$pid && $old) {
++            self::unlink($task->getId());
++            if ($o = Task::lookup($old))
++                self::noteOnParent($o, $task, __('Sub-task #%s made a top-level task'));
++        }
++        Http::response(200, JsonDataEncoder::encode(array('ok' => true,
++            'parent' => self::parentOf($task->getId()))), 'application/json');
++    }
++
++    /* ---------------------------------------------------------------
++     * Signal handlers
++     * ------------------------------------------------------------- */
++
++    /** A task created from the "Add Sub-task" dialog (st_parent posted) */
++    static function onTaskCreated($task) {
++        global $thisstaff, $ost;
++        $pid = (int) @$_POST['st_parent'];
++        if (!$pid || !$thisstaff)
++            return;
++        $parent = Task::lookup($pid);
++        $why = self::checkParent($task, $parent);
++        if ($why) {
++            $ost->logWarning('Sub-tasks', sprintf('Task #%s was created as a regular task: %s.',
++                $task->getNumber(), $why), false);
++            return;
++        }
++        self::link($task->getId(), $pid);
++        self::noteOnParent($parent, $task, __('Sub-task #%s added'));
++
++        // An open sub-task under a completed parent: reopen the parent
++        if (self::$opts['reopen_parent'] && $parent->isClosed() && $task->isOpen())
++            self::reopen($parent);
++    }
++
++    static function reopen($task) {
++        if (self::$reopening)
++            return;
++        self::$reopening = true;
++        $errors = array();
++        $task->setStatus('open', '', $errors);
++        self::$reopening = false;
++    }
++
++    /** Veto completing a parent while sub-tasks are open */
++    static function onCloseable($task, &$data) {
++        if (!self::$opts['block_close'] || !empty($data['warning']))
++            return;
++        $open = 0;
++        foreach (self::children($task->getId()) as $c)
++            if ($c->isOpen()) $open++;
++        if ($open)
++            $data['warning'] = sprintf(_N('This task has %d open sub-task and cannot be completed',
++                'This task has %d open sub-tasks and cannot be completed', $open), $open);
++    }
++
++    /** Reopening a sub-task reopens its completed parent */
++    static function onTaskUpdated($task, &$data) {
++        if (!self::$opts['reopen_parent'] || !isset($data['dirty'])
++                || !array_key_exists('flags', $data['dirty']))
++            return;
++        $wasOpen = (bool) ((int) $data['dirty']['flags'] & TaskModel::ISOPEN);
++        if ($wasOpen || !$task->isOpen())
++            return;
++        if (($pid = self::parentOf($task->getId())) && ($parent = Task::lookup($pid))
++                && $parent->isClosed())
++            self::reopen($parent);
++    }
++
++    /** Deleted task: drop its link; its sub-tasks become regular tasks */
++    static function onTaskDeleted($task, &$data=null) {
++        if (!self::ensureSchema())
++            return;
++        $id = (int) $task->getId();
++        db_query(sprintf('DELETE FROM `%s` WHERE task_id=%d OR parent_id=%d',
++            self::table(), $id, $id));
++        unset(self::$parentCache[$id]);
++    }
++
++    /* ---------------------------------------------------------------
++     * Views
++     * ------------------------------------------------------------- */
++
++    static function timeInfo($taskId) {
++        if (!class_exists('TimeTrackingPlugin', false) || !TimeTrackingPlugin::$opts
++                || !TimeTrackingPlugin::ensureSchema())
++            return null;
++        list($m, $c) = TimeTrackingPlugin::totals('A', $taskId);
++        return array_merge(array('minutes' => $m, 'amount' => $c),
++            TimeTrackingPlugin::fmtPair($m, $c));
++    }
++
++    static function taskInfo($t) {
++        $assigned = $t->getAssigned();
++        $info = array(
++            'id' => (int) $t->getId(),
++            'number' => (string) $t->getNumber(),
++            'title' => (string) $t->getTitle(),
++            'status' => (string) $t->getStatus(),
++            'open' => (bool) $t->isOpen(),
++            'assignee' => $assigned ? (string) $assigned : '',
++        );
++        if ($ti = self::timeInfo($t->getId()))
++            $info += array('time' => $ti['time'], 'cost' => $ti['cost'],
++                'minutes' => $ti['minutes'], 'amount' => $ti['amount']);
++        return $info;
++    }
++
++    static function onTaskView($task, &$data=null) {
++        global $thisstaff;
++        if (!self::$opts || !$thisstaff || !defined('OSTSCPINC') || !self::ensureSchema())
++            return;
++
++        $id = (int) $task->getId();
++        $ticketId = $task->object_type === ObjectModel::OBJECT_TYPE_TICKET
++            ? (int) $task->object_id : 0;
++        // Opened inside the ticket view (loaded by ajax.php/tickets/...)
++        $inTicket = $ticketId && strpos(@$_SERVER['REQUEST_URI'], 'ajax.php/tickets/') !== false;
++
++        $cfg = array(
++            'id' => $id,
++            'returnUrl' => $inTicket
++                ? sprintf('tickets.php?id=%d#tasks', $ticketId)
++                : sprintf('tasks.php?id=%d', $id),
++            'number' => (string) $task->getNumber(),
++            'inTicket' => $inTicket,
++            'hasTime' => self::timeInfo($id) !== null,
++        );
++        if ($pid = self::parentOf($id)) {
++            if ($p = Task::lookup($pid))
++                $cfg['parent'] = self::taskInfo($p);
++        }
++        else {
++            $cfg['own'] = self::timeInfo($id);
++            $cfg['children'] = array();
++            $tm = $cfg['own'] ? $cfg['own']['minutes'] : 0;
++            $tc = $cfg['own'] ? $cfg['own']['amount'] : 0;
++            foreach (self::children($id) as $c) {
++                $i = self::taskInfo($c);
++                $cfg['children'][] = $i;
++                $tm += @$i['minutes']; $tc += @$i['amount'];
++            }
++            if ($cfg['hasTime'])
++                $cfg['total'] = TimeTrackingPlugin::fmtPair($tm, $tc);
++            $cfg['canAdd'] = $task->isOpen() && self::canAddTo($task);
++            if ($cfg['canAdd']) {
++                $cfg['addUrl'] = $ticketId
++                    ? sprintf('ajax.php/tickets/%d/add-task', $ticketId) : 'ajax.php/tasks/add';
++                $cfg['formAction'] = $ticketId
++                    ? sprintf('#tickets/%d/add-task', $ticketId) : '#tasks/add';
++                $cfg['parents'] = array();
++                foreach (self::eligibleParents($task) as $p)
++                    $cfg['parents'][] = array('id' => (int) $p->getId(),
++                        'label' => sprintf('Task #%s — %s', $p->getNumber(), $p->getTitle()));
++                $cfg['deptId'] = self::$opts['same_dept'] ? (int) $task->getDeptId() : 0;
++            }
++        }
++        // Move: make this task a sub-task / change parent / make top-level
++        if ($task->checkStaffPerm($thisstaff, Task::PERM_EDIT) && empty($cfg['children'])) {
++            $targets = array();
++            foreach (self::eligibleParents($task) as $p)
++                if ($p->getId() != $id)
++                    $targets[] = array('id' => (int) $p->getId(),
++                        'label' => sprintf('Task #%s — %s', $p->getNumber(), $p->getTitle()));
++            if ($pid && ($p = Task::lookup($pid)) && $p->isClosed())
++                array_unshift($targets, array('id' => (int) $p->getId(),
++                    'label' => sprintf('Task #%s — %s', $p->getNumber(), $p->getTitle())));
++            if ($targets || $pid) {
++                $cfg['moveTargets'] = $targets;
++                $cfg['moveUrl'] = sprintf('ajax.php/subtasks/%d/parent', $id);
++            }
++        }
++        $json = json_encode($cfg, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
++        include __DIR__ . '/view.inc.php';
++    }
++
++    /** Ticket view: nest sub-tasks under their parent on the Tasks tab */
++    static function onTicketView($ticket, &$data=null) {
++        global $thisstaff;
++        if (!self::$opts || !$thisstaff || !defined('OSTSCPINC') || !self::ensureSchema())
++            return;
++        $ids = array();
++        foreach (Task::objects()->filter(array(
++                'object_type' => ObjectModel::OBJECT_TYPE_TICKET,
++                'object_id' => $ticket->getId()))->values_flat('id') as $row)
++            $ids[] = (int) $row[0];
++        $map = self::parentMap($ids);
++        if (!$map)
++            return;
++        $counts = array();
++        foreach ($map as $c => $p)
++            $counts[$p] = (isset($counts[$p]) ? $counts[$p] : 0) + 1;
++        $json = json_encode(array('ticketId' => (int) $ticket->getId(),
++            'map' => (object) $map, 'counts' => (object) $counts));
++        include __DIR__ . '/ticket.inc.php';
++    }
++}
+diff --git a/include/plugins/sub-tasks/ticket.inc.php b/include/plugins/sub-tasks/ticket.inc.php
+new file mode 100644
+index 0000000..0a6417c
+--- /dev/null
++++ b/include/plugins/sub-tasks/ticket.inc.php
+@@ -0,0 +1,64 @@
++<?php
++// Rendered at the top of the staff ticket view (object.view signal).
++// Expects $json from SubTasksPlugin::onTicketView(): which of the ticket's
++// tasks are sub-tasks, so the Tasks tab can list them under their parent.
++if (!defined('OSTSCPINC')) die('Access Denied');
++?>
++<style type="text/css">
++  tr.st-row > td { background: #fafcff; }
++  td.st-title { padding-left: 26px !important; }
++  .st-arrow { color: #999; margin-right: 4px; }
++  .st-chip { display: inline-block; background: #eef4fa; border: 1px solid #cfe0f0; color: #2a5d8f;
++      border-radius: 9px; padding: 0 7px; font-size: 11px; line-height: 16px; margin-left: 6px; font-weight: normal; }
++</style>
++<script type="text/javascript">
++(function($) {
++  var cfg = <?php echo $json; ?>;
++
++  function nest() {
++    var $tbody = $('form#tasks[action="#tickets/' + cfg.ticketId + '/tasks"] tbody.tasks').first();
++    if (!$tbody.length || $tbody.data('st-done')) return;
++    $tbody.data('st-done', 1);
++    var rows = {};
++    $tbody.children('tr[id]').each(function() { rows[this.id] = $(this); });
++    // Parent rows (in their current order), each followed by its sub-tasks
++    $.each(rows, function(id, $row) {
++      if (cfg.map[id]) return;
++      var n = cfg.counts[id];
++      if (!n) return;
++      var $title = $row.find('a[href$="/tasks/' + id + '/view"]').not('.preview').first();
++      $title.after(' <span class="st-chip">' + n + ' sub-task' + (n > 1 ? 's' : '') + '</span>');
++      var $last = $row;
++      $.each(cfg.map, function(child, parent) {
++        if (String(parent) !== String(id) || !rows[child]) return;
++        $last = rows[child].insertAfter($last);
++      });
++    });
++    $.each(cfg.map, function(child, parent) {
++      var $row = rows[child];
++      if (!$row || !rows[parent]) return;
++      $row.addClass('st-row');
++      var $a = $row.find('a[href$="/tasks/' + child + '/view"]').not('.preview').first();
++      $a.closest('td').addClass('st-title');
++      $a.before('<span class="st-arrow">&#8627;</span>');
++    });
++  }
++
++  function watch() {
++    if (!window.MutationObserver) return nest();
++    if (window.__stObserver) window.__stObserver.disconnect();
++    var timer;
++    window.__stObserver = new MutationObserver(function() {
++      clearTimeout(timer);
++      timer = setTimeout(function() {
++        if (!$('ul#ticket_tabs').length) { window.__stObserver.disconnect(); return; }
++        nest();
++      }, 100);
++    });
++    window.__stObserver.observe(document.body, {childList: true, subtree: true});
++    nest();
++  }
++
++  $(function() { setTimeout(watch, 0); });
++})(jQuery);
++</script>
+diff --git a/include/plugins/sub-tasks/view.inc.php b/include/plugins/sub-tasks/view.inc.php
+new file mode 100644
+index 0000000..9188cf5
+--- /dev/null
++++ b/include/plugins/sub-tasks/view.inc.php
+@@ -0,0 +1,218 @@
++<?php
++// Rendered at the top of the staff task view (object.view signal).
++// Expects $json and $id from SubTasksPlugin::onTaskView().
++if (!defined('OSTSCPINC')) die('Access Denied');
++?>
++<span id="st-anchor-<?php echo (int) $id; ?>" style="display:none"></span>
++<style type="text/css">
++  .st-panel { margin: 12px 0 14px; }
++  .st-panel h4 { margin: 0 0 4px; font-size: 1em; overflow: hidden; line-height: 22px; }
++  .st-panel h4 .st-add { float: right; }
++  .st-panel table { width: 100%; border-collapse: collapse; }
++  .st-panel th, .st-panel td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #e5e5e5; }
++  .st-panel .num { text-align: right; white-space: nowrap; }
++  .st-panel tr.st-total td { font-weight: bold; border-top: 2px solid #ccc; border-bottom: none; }
++  .st-panel tr.st-sub td.st-name { padding-left: 26px; }
++  .st-panel .st-empty { color: #888; margin: 2px 0 0; }
++  .st-arrow { color: #999; margin-right: 4px; }
++  .st-chip { display: inline-block; background: #eef4fa; border: 1px solid #cfe0f0; color: #2a5d8f;
++      border-radius: 9px; padding: 0 7px; font-size: 11px; line-height: 16px; margin-left: 6px; font-weight: normal; }
++  .st-done { color: #1a7f37; }
++  .st-of { margin: 8px 0 4px; padding: 6px 10px; background: #f4f8fc; border: 1px solid #dde8f3; border-radius: 3px; }
++  .st-of .faded { margin-left: 8px; }
++  .st-pick { padding: 4px 0 10px; }
++  .st-pick label { font-weight: bold; margin-right: 8px; }
++  .st-pick select { min-width: 340px; }
++  .st-pick .faded { margin-top: 5px; font-size: 12px; }
++  .st-move { margin-left: 10px; font-size: 12px; }
++  .st-move select { max-width: 360px; margin: 0 4px; }
++  .st-panel .st-movebar { margin-top: 4px; }
++</style>
++<script type="text/javascript">
++(function($) {
++  var cfg = <?php echo $json; ?>;
++
++  function esc(s) { return $('<div/>').text(s == null ? '' : String(s)).html(); }
++  function link(t) {
++    return '<a href="tasks.php?id=' + t.id + '">Task #' + esc(t.number) + '</a>';
++  }
++
++  // Reload the page the user is on (ticket Tasks tab or task view)
++  function go() {
++    var a = document.createElement('a'); a.href = cfg.returnUrl;
++    if (a.pathname + a.search === window.location.pathname + window.location.search) {
++      window.location.hash = a.hash;
++      window.location.reload();
++    }
++    else window.location.href = cfg.returnUrl;
++  }
++
++  /* ---- Move: make a sub-task / change parent / make top-level ---- */
++  function moveLinks() {
++    if (!cfg.moveUrl) return '';
++    if (cfg.parent)
++      return '<span class="st-move">' +
++        (cfg.moveTargets.length > 1 || (cfg.moveTargets.length && cfg.moveTargets[0].id !== cfg.parent.id)
++          ? '<a href="#" class="st-move-open no-pjax">Change parent</a> &middot; ' : '') +
++        '<a href="#" class="st-move-top no-pjax">Make top-level task</a></span>';
++    return cfg.moveTargets.length
++      ? '<span class="st-move"><a href="#" class="st-move-open no-pjax"><i class="icon-level-down"></i> Make this a sub-task of&hellip;</a></span>'
++      : '';
++  }
++
++  function saveParent(parentId) {
++    $.ajax({url: cfg.moveUrl, type: 'POST', data: {parent: parentId}})
++      .done(go)
++      .fail(function(xhr) {
++        $.sysAlert('Sub-tasks', xhr.responseText || 'Unable to move the task');
++      });
++  }
++
++  function openMover($link) {
++    var $wrap = $link.closest('.st-move');
++    var opts = '';
++    $.each(cfg.moveTargets, function(i, t) {
++      if (cfg.parent && t.id === cfg.parent.id) return;
++      opts += '<option value="' + t.id + '">' + esc(t.label) + '</option>';
++    });
++    $wrap.html('Parent: <select>' + opts + '</select><button type="button" class="button st-move-save">Move</button> ' +
++      '<a href="#" class="st-move-cancel no-pjax">Cancel</a>');
++    $wrap.data('html', moveLinks());
++  }
++
++  function scope() { return $('#st-anchor-' + cfg.id).parent(); }
++
++  function placePanel($scope, html) {
++    var $after = $scope.find('table.custom-data').last();
++    if (!$after.length) $after = $scope.find('table.ticket_info').first();
++    if (!$after.length) $after = $scope.find('.tixTitle').first();
++    $(html).insertAfter($after);
++  }
++
++  function renderParentLine($scope) {
++    var p = cfg.parent;
++    var line = '<div class="st-of"><i class="icon-sitemap"></i> Sub-task of ' + link(p) +
++      ' &mdash; ' + esc(p.title) + ' <span class="st-chip">' + esc(p.status) + '</span>' +
++      '<span class="faded">Time and cost posted here also count toward ' + 'Task #' + esc(p.number) + '.</span>' +
++      moveLinks() + '</div>';
++    $(line).insertAfter($scope.find('.tixTitle').first());
++    // Header: "Task #12 / Task #9 / Ticket #…" (or "All Tasks / Task #9 / Task #12" in a ticket)
++    var $rt = $scope.find('a#reload-task').first();
++    var crumb = link(p);
++    if (cfg.inTicket) $rt.before(crumb + '&nbsp;/&nbsp;');
++    else $rt.after('&nbsp;/&nbsp;' + crumb);
++  }
++
++  function renderPanel($scope) {
++    var kids = cfg.children || [];
++    if (!kids.length && !cfg.canAdd && !moveLinks()) return;
++    var done = 0;
++    $.each(kids, function(i, k) { if (!k.open) done++; });
++    var head = '<h4><i class="icon-sitemap"></i> Sub-tasks' +
++      (kids.length ? ' <span class="st-chip">' + done + ' of ' + kids.length + ' completed</span>' : '') +
++      (cfg.canAdd ? '<a class="st-add action-button no-pjax" href="#"><i class="icon-plus-sign"></i> Add Sub-task</a>' : '') +
++      '</h4>';
++    if (!kids.length)
++      return placePanel($scope, '<div class="st-panel">' + head + '<p class="st-empty">No sub-tasks yet.' +
++        moveLinks() + '</p></div>');
++
++    var tcols = cfg.hasTime ? '<th class="num">Time</th><th class="num">Cost</th>' : '';
++    var rows = '';
++    if (cfg.hasTime && cfg.own)
++      rows += '<tr><td>This task</td><td></td><td></td><td class="num">' + esc(cfg.own.time) +
++        '</td><td class="num">' + esc(cfg.own.cost) + '</td></tr>';
++    $.each(kids, function(i, k) {
++      rows += '<tr class="st-sub"><td class="st-name"><span class="st-arrow">&#8627;</span>' + link(k) +
++        ' &mdash; ' + esc(k.title) + '</td><td>' + (k.open ? '' : '<span class="st-done">&#10003;</span> ') +
++        esc(k.status) + '</td><td>' + (esc(k.assignee) || '&mdash;') + '</td>' +
++        (cfg.hasTime ? '<td class="num">' + esc(k.time) + '</td><td class="num">' + esc(k.cost) + '</td>' : '') +
++        '</tr>';
++    });
++    if (cfg.hasTime && cfg.total)
++      rows += '<tr class="st-total"><td>Total incl. sub-tasks</td><td></td><td></td><td class="num">' +
++        esc(cfg.total.time) + '</td><td class="num">' + esc(cfg.total.cost) + '</td></tr>';
++    placePanel($scope, '<div class="st-panel">' + head + '<table><thead><tr><th>Task</th><th>Status</th>' +
++      '<th>Assigned to</th>' + tcols + '</tr></thead><tbody>' + rows + '</tbody></table></div>');
++  }
++
++  /* ---- "Add Sub-task": osTicket's own New Task dialog + a parent picker ---- */
++  function openDialog() {
++    var pending = true, chosen = String(cfg.id);
++    var popup = $('.dialog#popup')[0];
++    var obs = window.MutationObserver ? new MutationObserver(function() {
++      if (!pending) return;
++      if (!$(popup).is(':visible')) { pending = false; obs.disconnect(); return; }
++      inject();
++    }) : null;
++
++    function inject() {
++      var $form = $('#popup form').filter(function() {
++        return $(this).attr('action') === cfg.formAction;
++      }).first();
++      if (!$form.length || $form.data('st-done')) return;
++      $form.data('st-done', 1);
++      $('#popup h3.drag-handle').first().text('Task #' + cfg.number + ': Add Sub-task');
++      var opts = '';
++      $.each(cfg.parents, function(i, p) {
++        opts += '<option value="' + p.id + '"' + (String(p.id) === chosen ? ' selected' : '') + '>' +
++          esc(p.label) + '</option>';
++      });
++      opts += '<option value=""' + (chosen === '' ? ' selected' : '') + '>(none &mdash; a regular task)</option>';
++      var $pick = $('<div class="st-pick"><label>Parent task:</label><select name="st_parent">' + opts +
++        '</select><div class="faded">The sub-task is a normal task' +
++        (cfg.inTicket || cfg.formAction.indexOf('#tickets/') === 0 ? ' on the same ticket' : '') +
++        '; its time and cost count toward the parent.</div></div>');
++      $pick.find('select').on('change', function() { chosen = $(this).val(); });
++      $form.prepend($pick);
++      if (cfg.deptId) {
++        var $dept = $form.find('label').filter(function() {
++          return /department/i.test($(this).text());
++        }).first().closest('fieldset, td, div').find('select').first();
++        if ($dept.length && !$dept.val() && $dept.find('option[value="' + cfg.deptId + '"]').length)
++          $dept.val(String(cfg.deptId)).trigger('change');
++      }
++    }
++
++    $.dialog(cfg.addUrl, [201], function() {
++      pending = false;
++      if (obs) obs.disconnect();
++      go();
++      return false;
++    }, {size: 'large', onshow: inject});
++    if (obs) obs.observe(popup, {attributes: true, attributeFilter: ['style'], childList: true, subtree: true});
++  }
++
++  function init() {
++    var $scope = scope();
++    if (!$scope.length || $scope.data('st-done')) return;
++    $scope.data('st-done', 1);
++    if (cfg.parent) renderParentLine($scope);
++    else renderPanel($scope);
++    $scope.off('click.st').on('click.st', 'a.st-add', function(e) {
++      e.preventDefault();
++      openDialog();
++      return false;
++    }).on('click.st', 'a.st-move-open', function(e) {
++      e.preventDefault();
++      openMover($(this));
++      return false;
++    }).on('click.st', 'a.st-move-cancel', function(e) {
++      e.preventDefault();
++      var $w = $(this).closest('.st-move');
++      $w.replaceWith($w.data('html'));
++      return false;
++    }).on('click.st', 'button.st-move-save', function(e) {
++      e.preventDefault();
++      saveParent($(this).closest('.st-move').find('select').val());
++      return false;
++    }).on('click.st', 'a.st-move-top', function(e) {
++      e.preventDefault();
++      if (confirm('Make Task #' + cfg.number + ' a top-level task again?')) saveParent('');
++      return false;
++    });
++  }
++
++  // Normal page load, PJAX navigation and tasks loaded by AJAX in a ticket
++  $(function() { setTimeout(init, 0); });
++})(jQuery);
++</script>
 diff --git a/include/plugins/task-status/config.php b/include/plugins/task-status/config.php
 new file mode 100644
 index 0000000..03ab312
@@ -1368,12 +2201,555 @@ index 0000000..b9a299c
 +        is closed or deleted.',
 +    'plugin' =>         'convert.php:TicketToTaskPlugin',
 +);
+diff --git a/include/plugins/time-tracking/agentreport.php b/include/plugins/time-tracking/agentreport.php
+new file mode 100644
+index 0000000..6f68a24
+--- /dev/null
++++ b/include/plugins/time-tracking/agentreport.php
+@@ -0,0 +1,331 @@
++<?php
++/*********************************************************************
++ * My Time report (part of the Time & Cost Tracking plugin)
++ *
++ * Staff page: scp/mytime.php (Dashboard > My Time)
++ *
++ * Every time / cost entry one agent logged in a period (this / last week,
++ * month, quarter, year, or custom dates), as
++ *
++ *  - Entries:   totals, a per-day (or per-week / per-month) summary and
++ *               every entry with its ticket, task, category and note
++ *  - Timesheet: tickets and tasks down the side, days (or weeks / months
++ *               for longer periods) across the top, hours in the cells
++ *
++ * with Excel (both sheets) and CSV exports and a print layout.
++ *
++ * Access: every agent sees their own time. Department managers can pick
++ * agents whose primary department they manage; admins can pick anyone.
++ * Opening totals imported from hand-entered values have no agent and are
++ * not included.
++ *********************************************************************/
++
++class AgentTimeReport {
++
++    static function enabled() {
++        return TimeReports::enabled();
++    }
++
++    static function canView($staff) {
++        return $staff && self::enabled();
++    }
++
++    /** staff_id => name of the agents $staff may report on (self first) */
++    static function agentsFor($staff) {
++        $list = array((int) $staff->getId() => (string) $staff->getName());
++        $q = null;
++        if ($staff->isAdmin())
++            $q = Staff::objects();
++        else {
++            $depts = array();
++            foreach (Dept::objects()->filter(array('manager_id' => $staff->getId()))
++                    ->values_flat('id') as $row)
++                $depts[] = (int) $row[0];
++            if ($depts)
++                $q = Staff::objects()->filter(array('dept_id__in' => $depts));
++        }
++        if ($q) {
++            $others = array();
++            foreach ($q->filter(array('isactive' => 1))
++                    ->values_flat('staff_id', 'firstname', 'lastname') as $r)
++                if ((int) $r[0] !== (int) $staff->getId())
++                    $others[(int) $r[0]] = trim($r[1] . ' ' . $r[2]);
++            asort($others, SORT_NATURAL | SORT_FLAG_CASE);
++            $list += $others;
++        }
++        return $list;
++    }
++
++    /* ---------------------------------------------------------------
++     * Periods
++     * ------------------------------------------------------------- */
++
++    static function periods() {
++        return array(
++            'this_week'    => 'This Week',
++            'last_week'    => 'Last Week',
++            'this_month'   => 'This Month',
++            'last_month'   => 'Last Month',
++            'this_quarter' => 'This Quarter',
++            'last_quarter' => 'Last Quarter',
++            'this_year'    => 'This Year',
++            'last_year'    => 'Last Year',
++            'custom'       => 'Custom Dates',
++        );
++    }
++
++    /** Start of the week containing $d (00:00) */
++    static function weekStart($d) {
++        $d = (clone $d)->setTime(0, 0, 0);
++        $dow = (int) $d->format('N');           // 1 = Monday .. 7 = Sunday
++        $back = TimeTrackingPlugin::$opts['week_start'] === 'sun' ? $dow % 7 : $dow - 1;
++        return $d->modify("-{$back} days");
++    }
++
++    /** array(start, end (exclusive), label); never open-ended */
++    static function resolve($key, $from='', $to='') {
++        $tz = TimeReports::userTz();
++        $now = new DateTime('now', $tz);
++        switch ($key) {
++        case 'this_week':
++        case 'last_week':
++            $s = self::weekStart($now);
++            if ($key === 'last_week')
++                $s->modify('-7 days');
++            $e = (clone $s)->modify('+7 days');
++            return array($s, $e, 'Week of ' . $s->format('M j, Y'));
++        case 'custom':
++            list($s, $e, $label) = TimeReports::resolve('custom', $from, $to);
++            if ($s && $e)
++                return array($s, $e, $label);
++            // Incomplete custom range: fall back to this week
++            return self::resolve('this_week');
++        default:
++            return TimeReports::resolve($key);
++        }
++    }
++
++    /**
++     * Column grouping for the period: 'day' up to 31 days, 'week' up to
++     * 26 weeks, otherwise 'month'. Returns array(unit, buckets) where
++     * buckets is array(key => array(label, start DateTime, weekend)).
++     */
++    static function buckets($start, $end) {
++        $days = (int) round(($end->getTimestamp() - $start->getTimestamp()) / 86400);
++        $unit = $days <= 31 ? 'day' : ($days <= 182 ? 'week' : 'month');
++        $out = array();
++        if ($unit === 'day') {
++            for ($d = clone $start; $d < $end; $d->modify('+1 day'))
++                $out[$d->format('Y-m-d')] = array($d->format('D n/j'), clone $d,
++                    (int) $d->format('N') >= 6);
++        }
++        elseif ($unit === 'week') {
++            for ($d = self::weekStart($start); $d < $end; $d->modify('+7 days'))
++                $out[$d->format('Y-m-d')] = array('Wk ' . $d->format('n/j'), clone $d, false);
++        }
++        else {
++            $d = (clone $start)->modify('first day of this month')->setTime(0, 0, 0);
++            for (; $d < $end; $d->modify('+1 month'))
++                $out[$d->format('Y-m')] = array($d->format('M Y'), clone $d, false);
++        }
++        return array($unit, $out);
++    }
++
++    static function bucketKey($unit, $dt) {
++        if ($unit === 'day')
++            return $dt->format('Y-m-d');
++        if ($unit === 'week')
++            return self::weekStart($dt)->format('Y-m-d');
++        return $dt->format('Y-m');
++    }
++
++    /* ---------------------------------------------------------------
++     * Data
++     * ------------------------------------------------------------- */
++
++    /** One agent's entries in [start, end), oldest first */
++    static function entries($staffId, $start, $end) {
++        if (!TimeTrackingPlugin::ensureSchema())
++            return array();
++        $P = TABLE_PREFIX;
++        $sql = sprintf("SELECT e.id, e.object_type, e.object_id, e.ticket_id, e.minutes, e.cost,
++                    e.created, t.number AS tnum, tc.subject, k.number AS knum, kc.title AS ktitle,
++                    te.title AS etitle, te.body AS ebody
++                FROM `%s` e
++                LEFT JOIN `{$P}ticket` t ON (e.ticket_id > 0 AND t.ticket_id = e.ticket_id)
++                LEFT JOIN `{$P}ticket__cdata` tc ON (tc.ticket_id = t.ticket_id)
++                LEFT JOIN `{$P}task` k ON (e.object_type = 'A' AND k.id = e.object_id)
++                LEFT JOIN `{$P}task__cdata` kc ON (kc.task_id = k.id)
++                LEFT JOIN `{$P}thread_entry` te ON (e.thread_entry_id > 0 AND te.id = e.thread_entry_id)
++                WHERE e.staff_id = %d AND e.kind = 'entry'
++                  AND e.created >= %s AND e.created < %s
++                ORDER BY e.created, e.id",
++            TimeTrackingPlugin::table(), $staffId,
++            db_input(TimeReports::toDb($start)), db_input(TimeReports::toDb($end)));
++        $rows = array();
++        $tids = array();
++        $res = db_query($sql);
++        while ($res && ($r = db_fetch_array($res))) {
++            $r['when'] = TimeReports::fromDb($r['created']);
++            $r['note'] = self::excerpt($r['ebody'] ?: $r['etitle']);
++            if ((int) $r['ticket_id'])
++                $tids[(int) $r['ticket_id']] = 1;
++            $rows[] = $r;
++        }
++        $cats = TimeReports::categories(array_keys($tids));
++        foreach ($rows as &$r) {
++            $tid = (int) $r['ticket_id'];
++            $r['category'] = $tid ? (isset($cats[$tid]) ? $cats[$tid] : '') : '';
++            $r['ticket'] = $tid ? ($r['tnum'] ? '#' . $r['tnum'] : '(deleted ticket)') : '';
++            $r['task'] = $r['object_type'] === 'A'
++                ? ($r['knum'] ? 'Task #' . $r['knum'] : '(deleted task)') : '';
++            $r['title'] = $r['object_type'] === 'A' ? (string) $r['ktitle'] : (string) $r['subject'];
++        }
++        unset($r);
++        return $rows;
++    }
++
++    /** Plain-text start of a thread entry body */
++    static function excerpt($html, $len=140) {
++        $t = html_entity_decode(strip_tags(preg_replace('#<(br|/p|/div|/li)\b[^>]*>#i', ' ', (string) $html)),
++            ENT_QUOTES, 'UTF-8');
++        $t = trim(preg_replace('/\s+/u', ' ', $t));
++        return mb_strlen($t) > $len ? mb_substr($t, 0, $len - 1) . '…' : $t;
++    }
++
++    /** Totals, per-bucket summary and timesheet grid for $rows */
++    static function build($rows, $unit, $buckets) {
++        $total = array('minutes' => 0, 'cost' => 0.0, 'entries' => count($rows), 'items' => 0);
++        $summary = array();
++        foreach ($buckets as $k => $b)
++            $summary[$k] = array('minutes' => 0, 'cost' => 0.0, 'entries' => 0);
++        $grid = array();
++        foreach ($rows as $r) {
++            $m = (int) $r['minutes']; $c = (float) $r['cost'];
++            $total['minutes'] += $m; $total['cost'] += $c;
++            $k = self::bucketKey($unit, $r['when']);
++            if (isset($summary[$k])) {
++                $summary[$k]['minutes'] += $m; $summary[$k]['cost'] += $c;
++                $summary[$k]['entries']++;
++            }
++            // Timesheet row per ticket (own time) and per task
++            $item = (int) $r['ticket_id'] . ':' . ($r['object_type'] === 'A' ? (int) $r['object_id'] : 0);
++            if (!isset($grid[$item]))
++                $grid[$item] = array(
++                    'ticket' => $r['ticket'], 'task' => $r['task'],
++                    'subject' => (string) $r['subject'], 'title' => $r['title'],
++                    'category' => $r['category'],
++                    'sort' => sprintf('%s|%s|%010d', $r['tnum'] ?: 'zz', $r['task'] ? 1 : 0,
++                        $r['object_type'] === 'A' ? (int) $r['knum'] : 0),
++                    'cells' => array(), 'minutes' => 0, 'cost' => 0.0);
++            $g =& $grid[$item];
++            $g['cells'][$k] = (isset($g['cells'][$k]) ? $g['cells'][$k] : 0) + $m;
++            $g['minutes'] += $m; $g['cost'] += $c;
++            unset($g);
++        }
++        uasort($grid, function($a, $b) { return strnatcasecmp($a['sort'], $b['sort']); });
++        $total['items'] = count($grid);
++        return array($total, $summary, $grid);
++    }
++
++    /* ---------------------------------------------------------------
++     * Export
++     * ------------------------------------------------------------- */
++
++    static function entryColumns() {
++        return array('Date' => 'd', 'Ticket' => 's', 'Subject' => 's', 'Task' => 's',
++            'Task Title' => 's', 'Category' => 's', 'Note' => 's', 'Hours' => 'h', 'Cost' => 'm');
++    }
++
++    static function entryRows($rows) {
++        $out = array();
++        foreach ($rows as $r)
++            $out[] = array('Date' => $r['when'], 'Ticket' => $r['ticket'],
++                'Subject' => (string) $r['subject'], 'Task' => $r['task'],
++                'Task Title' => $r['task'] ? (string) $r['ktitle'] : '',
++                'Category' => $r['category'], 'Note' => $r['note'],
++                'Hours' => round($r['minutes'] / 60, 2), 'Cost' => round((float) $r['cost'], 2));
++        return $out;
++    }
++
++    static function gridColumns($buckets) {
++        $cols = array('Ticket / Task' => 's', 'Category' => 's');
++        foreach ($buckets as $b)
++            $cols[$b[0]] = 'h';
++        return $cols + array('Total Hours' => 'h', 'Cost' => 'm');
++    }
++
++    static function gridLabel($g) {
++        $l = $g['ticket'] ?: '';
++        if ($g['task'])
++            $l .= ($l ? ' › ' : '') . $g['task'];
++        return trim($l . ' — ' . $g['title'], ' —');
++    }
++
++    static function gridRows($grid, $buckets) {
++        $out = array();
++        foreach ($grid as $g) {
++            $row = array('Ticket / Task' => self::gridLabel($g), 'Category' => $g['category']);
++            foreach ($buckets as $k => $b)
++                if (!empty($g['cells'][$k]))
++                    $row[$b[0]] = round($g['cells'][$k] / 60, 2);
++            $row['Total Hours'] = round($g['minutes'] / 60, 2);
++            $row['Cost'] = round($g['cost'], 2);
++            $out[] = $row;
++        }
++        return $out;
++    }
++
++    static function fileName($agent, $label, $ext, $suffix='') {
++        return 'my-time-' . trim(preg_replace('/[^A-Za-z0-9]+/', '-', $agent . ' ' . $label), '-')
++            . ($suffix ? '-' . $suffix : '') . '.' . $ext;
++    }
++
++    /* ---------------------------------------------------------------
++     * Page
++     * ------------------------------------------------------------- */
++
++    /** Called from scp/mytime.php after staff.inc.php */
++    static function page() {
++        global $thisstaff, $ost, $nav, $cfg;
++        if (!self::canView($thisstaff))
++            Http::response(403, __('Access Denied'));
++
++        $agents = self::agentsFor($thisstaff);
++        $agentId = isset($_GET['agent']) ? (int) $_GET['agent'] : (int) $thisstaff->getId();
++        if (!isset($agents[$agentId]))
++            Http::response(403, __('Access Denied'));
++        $agentName = $agents[$agentId];
++
++        $periods = self::periods();
++        $period = isset($periods[@$_GET['period']]) ? $_GET['period'] : 'this_week';
++        list($start, $end, $label) = self::resolve($period, @$_GET['from'], @$_GET['to']);
++        $view = @$_GET['view'] === 'timesheet' ? 'timesheet' : 'entries';
++
++        $rows = self::entries($agentId, $start, $end);
++        list($unit, $buckets) = self::buckets($start, $end);
++        list($total, $summary, $grid) = self::build($rows, $unit, $buckets);
++
++        switch (@$_GET['export']) {
++        case 'xlsx':
++            if (class_exists('ZipArchive'))
++                TimeReports::sendWorkbook(array(
++                    'Entries' => TimeReports::sheetXml(self::entryColumns(), self::entryRows($rows)),
++                    'Timesheet' => TimeReports::sheetXml(self::gridColumns($buckets),
++                        self::gridRows($grid, $buckets)),
++                ), self::fileName($agentName, $label, 'xlsx'));
++            // no ZipArchive: fall through to CSV
++        case 'csv':
++            if (@$_GET['layout'] === 'timesheet')
++                TimeReports::sendCsvRows(self::gridColumns($buckets), self::gridRows($grid, $buckets),
++                    self::fileName($agentName, $label, 'csv', 'timesheet'));
++            TimeReports::sendCsvRows(self::entryColumns(), self::entryRows($rows),
++                self::fileName($agentName, $label, 'csv', 'entries'));
++        }
++
++        $nav->setTabActive('dashboard');
++        require STAFFINC_DIR . 'header.inc.php';
++        include __DIR__ . '/agentreport.tmpl.php';
++        include STAFFINC_DIR . 'footer.inc.php';
++    }
++}
+diff --git a/include/plugins/time-tracking/agentreport.tmpl.php b/include/plugins/time-tracking/agentreport.tmpl.php
+new file mode 100644
+index 0000000..9e99ec7
+--- /dev/null
++++ b/include/plugins/time-tracking/agentreport.tmpl.php
+@@ -0,0 +1,200 @@
++<?php
++// My Time page body. Variables from AgentTimeReport::page().
++if (!defined('OSTSCPINC')) die('Access Denied');
++$h = function($s) { return Format::htmlchars((string) $s); };
++$cur = TimeTrackingPlugin::$opts['currency'];
++$money = function($v) use ($cur) {
++    return ($v < 0 ? '-' : '') . $cur . number_format(abs($v), 2);
++};
++$hrs = function($m, $blank=false) { return ($blank && !$m) ? '' : number_format($m / 60, 2); };
++$qs = function($extra) {
++    $q = array_merge($_GET, $extra);
++    foreach ($q as $k => $v) if ($v === null) unset($q[$k]);
++    return 'mytime.php?' . Http::build_query($q);
++};
++$unitName = array('day' => 'Day', 'week' => 'Week', 'month' => 'Month');
++$ticketLink = function($r) use ($h) {
++    if ((int) $r['ticket_id'] && $r['tnum'])
++        return sprintf('<a href="tickets.php?id=%d">%s</a>', $r['ticket_id'], $h($r['ticket']));
++    return $h($r['ticket']);
++};
++$taskLink = function($r) use ($h) {
++    if ($r['object_type'] === 'A' && $r['knum'])
++        return sprintf('<a href="tasks.php?id=%d">%s</a>', $r['object_id'], $h($r['task']));
++    return $h($r['task']);
++};
++?>
++<style type="text/css">
++  #ttm h2 { margin: 6px 0 12px; }
++  #ttm form.ttm-filter { background: #f7f7f7; border: 1px solid #ddd; padding: 8px 10px; margin-bottom: 12px; }
++  #ttm form.ttm-filter label { margin-right: 10px; }
++  #ttm .ttm-buttons { float: right; }
++  #ttm .ttm-buttons a { margin-left: 6px; }
++  #ttm .ttm-views { margin: 4px 0 10px; }
++  #ttm .ttm-views a { display: inline-block; padding: 4px 12px; border: 1px solid #ccc; border-radius: 3px 3px 0 0;
++      margin-right: 4px; background: #f3f3f3; color: #333; text-decoration: none; }
++  #ttm .ttm-views a.active { background: #fff; border-bottom-color: #fff; font-weight: bold; }
++  #ttm .ttm-totals { margin: 10px 0 14px; }
++  #ttm .ttm-totals span { display: inline-block; margin-right: 24px; font-size: 1.1em; }
++  #ttm .ttm-totals b { font-size: 1.2em; }
++  #ttm table.ttm { width: 100%; border-collapse: collapse; margin-bottom: 18px; }
++  #ttm table.ttm th, #ttm table.ttm td { padding: 4px 8px; border-bottom: 1px solid #e5e5e5; text-align: left; vertical-align: top; }
++  #ttm table.ttm th { background: #eee; }
++  #ttm .num { text-align: right !important; white-space: nowrap; }
++  #ttm tr.ttm-total td { font-weight: bold; border-top: 2px solid #bbb; }
++  #ttm td.ttm-note { color: #555; font-size: 92%; }
++  #ttm tr.ttm-empty td { color: #aaa; }
++  #ttm .ttm-grid-wrap { overflow-x: auto; }
++  #ttm table.ttm-grid th.cell, #ttm table.ttm-grid td.cell { text-align: right; min-width: 46px; white-space: nowrap; }
++  #ttm table.ttm-grid .we { background: #f6f6f6; }
++  #ttm table.ttm-grid th.we { background: #e4e4e4; }
++  #ttm table.ttm-grid td.item { min-width: 260px; }
++  #ttm table.ttm-grid td.item, #ttm table.ttm-grid th:first-child, #ttm table.ttm-grid tr.ttm-total td:first-child {
++      position: sticky; left: 0; z-index: 1; background: #fff; box-shadow: 1px 0 0 #e5e5e5; }
++  #ttm table.ttm-grid th:first-child { background: #eee; }
++  #ttm table.ttm-grid tr.ttm-task td.item { padding-left: 24px; }
++  #ttm table.ttm-grid td.tot, #ttm table.ttm-grid th.tot { border-left: 2px solid #ccc; font-weight: bold; }
++  #ttm h3 { margin: 14px 0 6px; }
++  #ttm .ttm-print-head { display: none; }
++  @media print {
++    #header, #nav, #sub_nav, #footer, .sticky.bar, #ttm form.ttm-filter, #ttm .ttm-views,
++    #ttm .ttm-buttons, #msg_notice, #msg_warning, #msg_error, .ttm-noprint { display: none !important; }
++    #ttm .ttm-print-head { display: block; }
++    #ttm a { color: #000; text-decoration: none; }
++    body, #container, #content { width: auto !important; margin: 0 !important; padding: 0 !important; }
++  }
++</style>
++<div id="ttm">
++<h2><i class="icon-time"></i> <?php echo __('My Time'); ?></h2>
++
++<form method="get" action="mytime.php" class="ttm-filter">
++  <span class="ttm-buttons">
++    <a class="button" href="<?php echo $h($qs(array('export' => 'xlsx'))); ?>"><i class="icon-download-alt"></i> Excel (.xlsx)</a>
++    <a class="button" href="<?php echo $h($qs(array('export' => 'csv', 'layout' => 'entries'))); ?>"><i class="icon-download-alt"></i> CSV (entries)</a>
++    <a class="button" href="<?php echo $h($qs(array('export' => 'csv', 'layout' => 'timesheet'))); ?>"><i class="icon-download-alt"></i> CSV (timesheet)</a>
++    <a class="button" href="#" onclick="window.print(); return false;"><i class="icon-print"></i> Print</a>
++  </span>
++  <?php if (count($agents) > 1) { ?>
++  <label><strong>Agent:</strong>
++    <select name="agent">
++      <?php foreach ($agents as $id => $name) { ?>
++      <option value="<?php echo (int) $id; ?>" <?php if ($id === $agentId) echo 'selected="selected"'; ?>><?php
++        echo $h($name . ($id === (int) $thisstaff->getId() ? ' (me)' : '')); ?></option>
++      <?php } ?>
++    </select></label>
++  <?php } ?>
++  <label><strong>Period:</strong>
++    <select name="period" id="ttm-period">
++      <?php foreach ($periods as $k => $v) { ?>
++      <option value="<?php echo $k; ?>" <?php if ($k === $period) echo 'selected="selected"'; ?>><?php echo $h($v); ?></option>
++      <?php } ?>
++    </select></label>
++  <span id="ttm-custom" style="<?php if ($period !== 'custom') echo 'display:none'; ?>">
++    <label>From <input type="date" name="from" value="<?php echo $h(@$_GET['from']); ?>"></label>
++    <label>To <input type="date" name="to" value="<?php echo $h(@$_GET['to']); ?>"></label>
++  </span>
++  <input type="hidden" name="view" value="<?php echo $h($view); ?>">
++  <input type="submit" value="Run report">
++  <div class="faded" style="margin-top:4px"><?php echo $h($agentName); ?> &mdash; <?php echo $h($label); ?>
++    &mdash; by the date each entry was logged</div>
++</form>
++
++<div class="ttm-print-head"><h3><?php echo $h($agentName); ?> &mdash; <?php echo $h($label); ?></h3></div>
++
++<div class="ttm-totals">
++  <span>Total time <b><?php echo $hrs($total['minutes']); ?> h</b></span>
++  <span>Total cost <b><?php echo $h($money($total['cost'])); ?></b></span>
++  <span>Entries <b><?php echo (int) $total['entries']; ?></b></span>
++  <span>Tickets / tasks <b><?php echo (int) $total['items']; ?></b></span>
++</div>
++
++<div class="ttm-views">
++  <a href="<?php echo $h($qs(array('view' => 'entries'))); ?>" class="<?php if ($view === 'entries') echo 'active'; ?>"><i class="icon-list"></i> Entries</a>
++  <a href="<?php echo $h($qs(array('view' => 'timesheet'))); ?>" class="<?php if ($view === 'timesheet') echo 'active'; ?>"><i class="icon-table"></i> Timesheet</a>
++</div>
++
++<?php if (!$rows) { ?>
++  <p class="faded">No time logged by <?php echo $h($agentName); ?> in this period.</p>
++<?php } elseif ($view === 'timesheet') { ?>
++  <div class="ttm-grid-wrap">
++  <table class="ttm ttm-grid">
++    <thead><tr>
++      <th>Ticket / Task</th>
++      <?php foreach ($buckets as $b) { ?>
++      <th class="cell<?php if ($b[2]) echo ' we'; ?>"><?php echo $h($b[0]); ?></th>
++      <?php } ?>
++      <th class="cell tot">Hours</th><th class="cell">Cost</th>
++    </tr></thead>
++    <tbody>
++    <?php foreach ($grid as $g) { ?>
++      <tr class="<?php echo $g['task'] ? 'ttm-task' : ''; ?>">
++        <td class="item"><?php echo $h(AgentTimeReport::gridLabel($g)); ?>
++          <?php if ($g['category']) { ?><span class="faded"> &middot; <?php echo $h($g['category']); ?></span><?php } ?></td>
++        <?php foreach ($buckets as $k => $b) { ?>
++        <td class="cell<?php if ($b[2]) echo ' we'; ?>"><?php echo $hrs(@$g['cells'][$k], true); ?></td>
++        <?php } ?>
++        <td class="cell tot"><?php echo $hrs($g['minutes']); ?></td>
++        <td class="cell"><?php echo $h($money($g['cost'])); ?></td>
++      </tr>
++    <?php } ?>
++      <tr class="ttm-total">
++        <td>Total</td>
++        <?php foreach ($buckets as $k => $b) { ?>
++        <td class="cell<?php if ($b[2]) echo ' we'; ?>"><?php echo $hrs($summary[$k]['minutes'], true); ?></td>
++        <?php } ?>
++        <td class="cell tot"><?php echo $hrs($total['minutes']); ?></td>
++        <td class="cell"><?php echo $h($money($total['cost'])); ?></td>
++      </tr>
++    </tbody>
++  </table>
++  </div>
++  <p class="faded ttm-noprint">Hours per <?php echo strtolower($unitName[$unit]); ?>.
++    <?php if ($unit !== 'day') echo 'Choose a period of up to 31 days to see individual days.'; ?></p>
++<?php } else { ?>
++  <h3>By <?php echo strtolower($unitName[$unit]); ?></h3>
++  <table class="ttm" style="width:auto;min-width:420px">
++    <thead><tr><th><?php echo $unitName[$unit]; ?></th><th class="num">Entries</th><th class="num">Hours</th><th class="num">Cost</th></tr></thead>
++    <tbody>
++    <?php foreach ($buckets as $k => $b) { $s = $summary[$k]; ?>
++      <tr class="<?php if (!$s['entries']) echo 'ttm-empty'; ?>">
++        <td><?php echo $h($unit === 'day' ? $b[1]->format('D, M j') : ($unit === 'week'
++            ? 'Week of ' . $b[1]->format('M j') : $b[0])); ?></td>
++        <td class="num"><?php echo $s['entries'] ?: ''; ?></td>
++        <td class="num"><?php echo $hrs($s['minutes'], true); ?></td>
++        <td class="num"><?php echo $s['entries'] ? $h($money($s['cost'])) : ''; ?></td>
++      </tr>
++    <?php } ?>
++      <tr class="ttm-total"><td>Total</td><td class="num"><?php echo (int) $total['entries']; ?></td>
++        <td class="num"><?php echo $hrs($total['minutes']); ?></td><td class="num"><?php echo $h($money($total['cost'])); ?></td></tr>
++    </tbody>
++  </table>
++
++  <h3>Entries</h3>
++  <table class="ttm">
++    <thead><tr><th>Date</th><th>Ticket</th><th>Task</th><th>Subject / title</th><th>Category</th><th>Note</th>
++      <th class="num">Hours</th><th class="num">Cost</th></tr></thead>
++    <tbody>
++    <?php foreach ($rows as $r) { ?>
++      <tr>
++        <td style="white-space:nowrap"><?php echo $h($r['when']->format('D M j, g:i A')); ?></td>
++        <td style="white-space:nowrap"><?php echo $ticketLink($r); ?></td>
++        <td style="white-space:nowrap"><?php echo $taskLink($r); ?></td>
++        <td><?php echo $h($r['title']); ?></td>
++        <td><?php echo $h($r['category']); ?></td>
++        <td class="ttm-note"><?php echo $h($r['note']); ?></td>
++        <td class="num"><?php echo $hrs($r['minutes']); ?></td>
++        <td class="num"><?php echo $h($money($r['cost'])); ?></td>
++      </tr>
++    <?php } ?>
++      <tr class="ttm-total"><td colspan="6">Total</td>
++        <td class="num"><?php echo $hrs($total['minutes']); ?></td><td class="num"><?php echo $h($money($total['cost'])); ?></td></tr>
++    </tbody>
++  </table>
++<?php } ?>
++</div>
++
++<script type="text/javascript">
++(function($) {
++  $('#ttm-period').on('change', function() { $('#ttm-custom').toggle(this.value === 'custom'); });
++})(jQuery);
++</script>
 diff --git a/include/plugins/time-tracking/config.php b/include/plugins/time-tracking/config.php
 new file mode 100644
-index 0000000..fe383b5
+index 0000000..e5d7716
 --- /dev/null
 +++ b/include/plugins/time-tracking/config.php
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,120 @@
 +<?php
 +require_once INCLUDE_DIR . 'class.plugin.php';
 +require_once INCLUDE_DIR . 'class.forms.php';
@@ -1480,12 +2856,23 @@ index 0000000..fe383b5
 +                    '60' => 'Next hour',
 +                ),
 +            )),
++            'week_start' => new ChoiceField(array(
++                'label' => 'Weeks start on',
++                'default' => 'mon',
++                'required' => true,
++                'hint' => 'Used by the My Time report (This Week / Last Week and
++                    the weekly timesheet columns).',
++                'choices' => array(
++                    'mon' => 'Monday',
++                    'sun' => 'Sunday',
++                ),
++            )),
 +        );
 +    }
 +}
 diff --git a/include/plugins/time-tracking/plugin.php b/include/plugins/time-tracking/plugin.php
 new file mode 100644
-index 0000000..a6ea0db
+index 0000000..e237fda
 --- /dev/null
 +++ b/include/plugins/time-tracking/plugin.php
 @@ -0,0 +1,14 @@
@@ -1493,7 +2880,7 @@ index 0000000..a6ea0db
 +
 +return array(
 +    'id' =>             'community:time-tracking', # notrans
-+    'version' =>        '1.9.1',
++    'version' =>        '1.11.0',
 +    'ost_version' =>    '1.17',
 +    'name' =>           /* trans */ 'Time & Cost Tracking',
 +    'author' =>         'Community contributors',
@@ -1505,10 +2892,10 @@ index 0000000..a6ea0db
 +);
 diff --git a/include/plugins/time-tracking/reports.php b/include/plugins/time-tracking/reports.php
 new file mode 100644
-index 0000000..6d17332
+index 0000000..a18bad3
 --- /dev/null
 +++ b/include/plugins/time-tracking/reports.php
-@@ -0,0 +1,1193 @@
+@@ -0,0 +1,1219 @@
 +<?php
 +/*********************************************************************
 + * Time & Cost Reports (part of the Time & Cost Tracking plugin)
@@ -2361,6 +3748,27 @@ index 0000000..6d17332
 +        exit;
 +    }
 +
++    /** Send $rows as CSV with typed $cols */
++    static function sendCsvRows($cols, $rows, $filename) {
++        header('Content-Type: text/csv; charset=UTF-8');
++        header('Content-Disposition: attachment; filename="' . $filename . '"');
++        $out = fopen('php://output', 'w');
++        fwrite($out, "\xEF\xBB\xBF");   // UTF-8 BOM for Excel
++        fputcsv($out, array_keys($cols));
++        foreach ($rows as $r) {
++            $line = array();
++            foreach ($cols as $name => $type) {
++                $v = isset($r[$name]) ? $r[$name] : '';
++                if ($type === 'd' && $v instanceof DateTime)
++                    $v = $v->format('Y-m-d H:i');
++                $line[] = self::csvSafe($v);
++            }
++            fputcsv($out, $line);
++        }
++        fclose($out);
++        exit;
++    }
++
 +    /** Neutralise spreadsheet formulas in text cells */
 +    static function csvSafe($v) {
 +        if (is_string($v) && $v !== '' && strpos('=+-@', $v[0]) !== false)
@@ -2383,7 +3791,8 @@ index 0000000..6d17332
 +        // style ids: 0 text, 1 bold, 2 money, 3 bold money, 4 hours, 5 bold hours, 6 date
 +        $widths = array('s' => 18, 'd' => 17, 'm' => 12, 'h' => 10, 'i' => 8);
 +        $wide = array('Subject' => 40, 'Task Title' => 34, 'Requester Email' => 26,
-+            'Requested By' => 22, 'Assigned To' => 20, 'Category' => 22);
++            'Requested By' => 22, 'Assigned To' => 20, 'Category' => 22, 'Note' => 50,
++            'Ticket / Task' => 50, 'Date' => 17);
 +        $o = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
 +            . '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
 +            . '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
@@ -2433,10 +3842,14 @@ index 0000000..6d17332
 +    static function sendXlsx($tree, $label) {
 +        if (!class_exists('ZipArchive'))
 +            return self::sendCsv($tree, $label, 'tickets');
-+        $sheets = array(
++        self::sendWorkbook(array(
 +            'Tickets' => self::sheetXml(self::ticketColumns(), self::ticketRows($tree)),
 +            'Detail'  => self::sheetXml(self::detailColumns(), self::detailRows($tree)),
-+        );
++        ), self::fileName($label, 'xlsx'));
++    }
++
++    /** Send a workbook: array(sheet name => worksheet XML from sheetXml()) */
++    static function sendWorkbook($sheets, $filename) {
 +        $styles = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
 +            . '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
 +            . '<numFmts count="3"><numFmt numFmtId="164" formatCode="#,##0.00"/>'
@@ -2462,7 +3875,7 @@ index 0000000..6d17332
 +        foreach (array_keys($sheets) as $name) {
 +            $i++;
 +            $ct .= '<Override PartName="/xl/worksheets/sheet' . $i . '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>';
-+            $wb .= '<sheet name="' . $name . '" sheetId="' . $i . '" r:id="rId' . $i . '"/>';
++            $wb .= '<sheet name="' . htmlspecialchars($name, ENT_XML1 | ENT_QUOTES, 'UTF-8') . '" sheetId="' . $i . '" r:id="rId' . $i . '"/>';
 +            $rels .= '<Relationship Id="rId' . $i . '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' . $i . '.xml"/>';
 +        }
 +        $tmp = tempnam(sys_get_temp_dir(), 'ttx');
@@ -2496,7 +3909,7 @@ index 0000000..6d17332
 +        $z->close();
 +
 +        header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-+        header('Content-Disposition: attachment; filename="' . self::fileName($label, 'xlsx') . '"');
++        header('Content-Disposition: attachment; filename="' . $filename . '"');
 +        header('Content-Length: ' . filesize($tmp));
 +        readfile($tmp);
 +        @unlink($tmp);
@@ -3009,10 +4422,10 @@ index 0000000..429a7e9
 +</script>
 diff --git a/include/plugins/time-tracking/timetracking.php b/include/plugins/time-tracking/timetracking.php
 new file mode 100644
-index 0000000..841b221
+index 0000000..7e7a4f7
 --- /dev/null
 +++ b/include/plugins/time-tracking/timetracking.php
-@@ -0,0 +1,457 @@
+@@ -0,0 +1,477 @@
 +<?php
 +/*********************************************************************
 + * Time & Cost Tracking plugin for osTicket 1.17 / 1.18
@@ -3034,6 +4447,7 @@ index 0000000..841b221
 +require_once INCLUDE_DIR . 'class.signal.php';
 +require_once __DIR__ . '/config.php';
 +require_once __DIR__ . '/reports.php';
++require_once __DIR__ . '/agentreport.php';
 +
 +class TimeTrackingPlugin extends Plugin {
 +    var $config_class = 'TimeTrackingConfig';
@@ -3062,6 +4476,10 @@ index 0000000..841b221
 +        if (!in_array($round, array(1, 6, 15, 30, 60)))
 +            $round = 6;
 +
++        $ws = $c->get('week_start');
++        if (is_array($ws))
++            $ws = key($ws);
++
 +        self::$opts = array(
 +            'time_field' => mb_strtolower(trim($c->get('time_field') ?: 'time')),
 +            'cost_field' => mb_strtolower(trim($c->get('cost_field') ?: 'cost')),
@@ -3073,6 +4491,7 @@ index 0000000..841b221
 +            'reports' => (bool) $c->get('reports', true),
 +            'category_field' => mb_strtolower(trim($c->get('category_field') ?: 'category')),
 +            'timer_round' => $round,
++            'week_start' => $ws === 'sun' ? 'sun' : 'mon',
 +        );
 +
 +        Signal::connect('threadentry.created', array(__CLASS__, 'onEntryCreated'));
@@ -3392,8 +4811,22 @@ index 0000000..841b221
 +                'title' => (string) $task->getTitle(),
 +                'status' => (string) $task->getStatus(),
 +                'open' => (bool) $task->isOpen(),
-+                'minutes' => $m, 'amount' => $c,
++                'minutes' => $m, 'amount' => $c, 'parent' => 0, 'subs' => 0,
 +            ), self::fmtPair($m, $c));
++        }
++        // Sub-tasks plugin: list each sub-task under its parent. Every row
++        // is still that task's own time, so the total is unchanged.
++        if ($tasks && class_exists('SubTasksPlugin', false) && SubTasksPlugin::active()) {
++            $byId = array();
++            foreach ($tasks as $t) $byId[$t['id']] = $t;
++            $ordered = array();
++            foreach (SubTasksPlugin::order(array_keys($byId)) as $id => $parent) {
++                $t = $byId[$id];
++                $t['parent'] = $parent;
++                if ($parent) $ordered[$parent]['subs']++;
++                $ordered[$id] = $t;
++            }
++            $tasks = array_values($ordered);
 +        }
 +        return array(
 +            'ticket' => array_merge(array('minutes' => $own[0], 'amount' => $own[1]),
@@ -3472,10 +4905,10 @@ index 0000000..841b221
 +}
 diff --git a/include/plugins/time-tracking/view.inc.php b/include/plugins/time-tracking/view.inc.php
 new file mode 100644
-index 0000000..cfaefe7
+index 0000000..1facff7
 --- /dev/null
 +++ b/include/plugins/time-tracking/view.inc.php
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,300 @@
 +<?php
 +// Rendered at the top of the staff ticket view (object.view signal).
 +// Expects $json (encoded config) from TimeTrackingPlugin::onTicketView().
@@ -3496,6 +4929,11 @@ index 0000000..cfaefe7
 +  #tt-summary table { width: 100%; border-collapse: collapse; }
 +  #tt-summary th, #tt-summary td { text-align: left; padding: 3px 8px; border-bottom: 1px solid #e5e5e5; }
 +  #tt-summary .num, .tt-col { text-align: right; white-space: nowrap; }
++  #tt-summary tr.tt-sub td:first-child { padding-left: 26px; }
++  #tt-summary tr.tt-sub td { color: #555; }
++  #tt-summary .tt-arrow { color: #999; margin-right: 4px; }
++  #tt-summary .tt-chip { display: inline-block; background: #eef4fa; border: 1px solid #cfe0f0; color: #2a5d8f;
++      border-radius: 9px; padding: 0 7px; font-size: 11px; line-height: 16px; margin-left: 6px; }
 +  #tt-summary tr.tt-total td { font-weight: bold; border-top: 2px solid #ccc; border-bottom: none; }
 +</style>
 +<script type="text/javascript">
@@ -3686,8 +5124,11 @@ index 0000000..cfaefe7
 +      '<td class="num">' + esc(summary.ticket.time) + '</td>' +
 +      '<td class="num">' + esc(summary.ticket.cost) + '</td></tr>';
 +    $.each(summary.tasks, function(i, t) {
-+      rows += '<tr><td><a href="tasks.php?id=' + t.id + '">Task #' + esc(t.number) + '</a> &mdash; ' +
-+        esc(t.title) + '</td><td>' + esc(t.status) + '</td>' +
++      rows += '<tr' + (t.parent ? ' class="tt-sub"' : '') + '><td>' +
++        (t.parent ? '<span class="tt-arrow">&#8627;</span>' : '') +
++        '<a href="tasks.php?id=' + t.id + '">Task #' + esc(t.number) + '</a> &mdash; ' +
++        esc(t.title) + (t.subs ? ' <span class="tt-chip">' + t.subs + ' sub-task' + (t.subs > 1 ? 's' : '') + '</span>' : '') +
++        '</td><td>' + esc(t.status) + '</td>' +
 +        '<td class="num">' + esc(t.time) + '</td><td class="num">' + esc(t.cost) + '</td></tr>';
 +    });
 +    rows += '<tr class="tt-total"><td>Total</td><td></td>' +
@@ -3906,6 +5347,26 @@ index 0000000..8e9179c
 +    resize: vertical;
 +    overflow-y: auto;
 +}
+diff --git a/scp/mytime.php b/scp/mytime.php
+new file mode 100644
+index 0000000..e32eb79
+--- /dev/null
++++ b/scp/mytime.php
+@@ -0,0 +1,14 @@
++<?php
++/*********************************************************************
++    mytime.php
++
++    My Time report (provided by the Time & Cost Tracking plugin)
++**********************************************************************/
++require('staff.inc.php');
++
++if (!class_exists('AgentTimeReport', false) || !AgentTimeReport::canView($thisstaff)) {
++    Http::response(404, __('Not found'));
++    exit;
++}
++AgentTimeReport::page();
++?>
 diff --git a/scp/tickets.php b/scp/tickets.php
 index 11a430a..053245a 100644
 --- a/scp/tickets.php
