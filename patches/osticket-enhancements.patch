@@ -2872,7 +2872,7 @@ index 0000000..e5d7716
 +}
 diff --git a/include/plugins/time-tracking/plugin.php b/include/plugins/time-tracking/plugin.php
 new file mode 100644
-index 0000000..e237fda
+index 0000000..f10b028
 --- /dev/null
 +++ b/include/plugins/time-tracking/plugin.php
 @@ -0,0 +1,14 @@
@@ -2880,7 +2880,7 @@ index 0000000..e237fda
 +
 +return array(
 +    'id' =>             'community:time-tracking', # notrans
-+    'version' =>        '1.11.0',
++    'version' =>        '1.11.1',
 +    'ost_version' =>    '1.17',
 +    'name' =>           /* trans */ 'Time & Cost Tracking',
 +    'author' =>         'Community contributors',
@@ -2892,10 +2892,10 @@ index 0000000..e237fda
 +);
 diff --git a/include/plugins/time-tracking/reports.php b/include/plugins/time-tracking/reports.php
 new file mode 100644
-index 0000000..a18bad3
+index 0000000..41030fc
 --- /dev/null
 +++ b/include/plugins/time-tracking/reports.php
-@@ -0,0 +1,1219 @@
+@@ -0,0 +1,1295 @@
 +<?php
 +/*********************************************************************
 + * Time & Cost Reports (part of the Time & Cost Tracking plugin)
@@ -3963,6 +3963,13 @@ index 0000000..a18bad3
 +                // Nothing to import when both are empty / zero
 +                $m = TimeTrackingPlugin::parseTime($v[0]);
 +                $k = TimeTrackingPlugin::parseCost($v[1]);
++                // A ticket's fields include its tasks' time: only the rest
++                // belongs to the ticket itself
++                if ($type === 'T' && $m !== false && $k !== false) {
++                    list($tm, $tc) = TimeTrackingPlugin::taskRowsTotal($id);
++                    $m = max(0, (int) $m - $tm);
++                    $k = max(0, round((float) $k - $tc, 2));
++                }
 +                if (!$m && !$k && $m !== false && $k !== false)
 +                    continue;
 +                $c[$type][$id] = $v;
@@ -3974,7 +3981,7 @@ index 0000000..a18bad3
 +            "SELECT COUNT(*) FROM `$T` e
 +             LEFT JOIN `{$P}ticket` t ON (e.object_type = 'T' AND t.ticket_id = e.object_id)
 +             LEFT JOIN `{$P}task` k ON (e.object_type = 'A' AND k.id = e.object_id)
-+             WHERE e.kind = 'opening' AND e.thread_entry_id = 0
++             WHERE e.kind IN ('opening', 'opening-net') AND e.thread_entry_id = 0
 +               AND NOT (e.created <=> t.created OR e.created <=> t.closed OR e.created <=> t.lastupdate
 +                     OR e.created <=> k.created OR e.created <=> k.closed OR e.created <=> k.updated)
 +               AND (t.ticket_id IS NOT NULL OR k.id IS NOT NULL)"));
@@ -4003,7 +4010,8 @@ index 0000000..a18bad3
 +        list($c, ) = self::importCandidates();
 +        $T = TimeTrackingPlugin::table();
 +        $stats = array('tickets' => 0, 'tasks' => 0, 'redated' => 0, 'skipped' => array());
-+        foreach (array('T', 'A') as $type) {
++        // Tasks first, so a ticket's import can leave out its tasks' time
++        foreach (array('A', 'T') as $type) {
 +            $dates = self::basisDates($type, array_keys($c[$type]), $basis);
 +            foreach ($c[$type] as $id => $v) {
 +                if (!isset($dates[$id])) continue;          // object deleted
@@ -4015,13 +4023,19 @@ index 0000000..a18bad3
 +                    $min = $min === false ? null : $min;
 +                    $cost = $cost === false ? null : $cost;
 +                }
++                if ($type === 'T') {
++                    list($tm, $tc) = TimeTrackingPlugin::taskRowsTotal($id);
++                    $min = max(0, (int) $min - $tm);
++                    $cost = max(0, round((float) $cost - $tc, 2));
++                }
 +                if (!$min && !$cost) continue;
 +                list($d, $tid) = $dates[$id];
 +                db_query(sprintf(
 +                    "INSERT INTO `%s` (object_type, object_id, ticket_id, thread_entry_id,
 +                        staff_id, kind, minutes, cost, created)
-+                     VALUES (%s, %d, %d, 0, 0, 'opening', %d, %s, %s)",
++                     VALUES (%s, %d, %d, 0, 0, %s, %d, %s, %s)",
 +                    $T, db_input($type), $id, $type === 'T' ? $id : $tid,
++                    db_input($type === 'T' ? 'opening-net' : 'opening'),
 +                    (int) $min, db_input(sprintf('%.2f', (float) $cost)), db_input($d)));
 +                $stats[$type === 'T' ? 'tickets' : 'tasks']++;
 +            }
@@ -4035,7 +4049,7 @@ index 0000000..a18bad3
 +                     : ($basis === 'updated' ? "COALESCE(x.$upd, x.created)" : 'x.created');
 +                db_query("UPDATE `$T` e JOIN $tbl x ON (x.$pk = e.object_id)
 +                          SET e.created = $col
-+                          WHERE e.object_type = '$type' AND e.kind = 'opening'
++                          WHERE e.object_type = '$type' AND e.kind IN ('opening', 'opening-net')
 +                            AND e.thread_entry_id = 0");
 +                $stats['redated'] += db_affected_rows();
 +            }
@@ -4046,6 +4060,63 @@ index 0000000..a18bad3
 +    /* ---------------------------------------------------------------
 +     * Page
 +     * ------------------------------------------------------------- */
++
++    /* ---------------------------------------------------------------
++     * Repair: ticket opening totals that repeat their tasks' time
++     *
++     * Before v1.11.1, a ticket's opening total (its hand-entered Time /
++     * Cost value, imported when time was first logged on the ticket
++     * itself, or by the import button) could include time already logged
++     * on its tasks, since a ticket's fields show the total including
++     * tasks. That task time was then counted twice. Row ids tell which task
++     * rows existed when the opening row was created.
++     * ------------------------------------------------------------- */
++
++    /** array(row id => info) for ticket opening rows that overlap task time */
++    static function doubleCounts() {
++        $T = TimeTrackingPlugin::table();
++        $P = TABLE_PREFIX;
++        $out = array();
++        $res = db_query("SELECT o.id, o.object_id AS ticket_id, o.minutes, o.cost, t.number,
++                    COALESCE(SUM(r.minutes), 0) AS tm, COALESCE(SUM(r.cost), 0) AS tc
++                FROM `$T` o
++                JOIN `$T` r ON (r.ticket_id = o.object_id AND r.object_type = 'A' AND r.id < o.id)
++                LEFT JOIN `{$P}ticket` t ON (t.ticket_id = o.object_id)
++                WHERE o.object_type = 'T' AND o.kind = 'opening'
++                GROUP BY o.id, o.object_id, o.minutes, o.cost, t.number
++                HAVING (tm > 0 AND o.minutes > 0) OR (tc > 0 AND o.cost > 0)
++                ORDER BY o.object_id");
++        while ($res && ($r = db_fetch_array($res))) {
++            $m = (int) $r['minutes']; $c = (float) $r['cost'];
++            $out[(int) $r['id']] = array(
++                'ticket_id' => (int) $r['ticket_id'],
++                'number' => (string) $r['number'],
++                'minutes' => $m, 'cost' => $c,
++                'dup_minutes' => min($m, (int) $r['tm']),
++                'dup_cost' => min($c, round((float) $r['tc'], 2)),
++                'new_minutes' => max(0, $m - (int) $r['tm']),
++                'new_cost' => max(0, round($c - (float) $r['tc'], 2)),
++            );
++        }
++        return $out;
++    }
++
++    /** Remove the repeated task time from those rows; refresh ticket totals */
++    static function fixDoubleCounts() {
++        $T = TimeTrackingPlugin::table();
++        $fixed = array();
++        foreach (self::doubleCounts() as $id => $d) {
++            if (!$d['new_minutes'] && !$d['new_cost'])
++                db_query(sprintf('DELETE FROM `%s` WHERE id=%d', $T, $id));
++            else
++                db_query(sprintf("UPDATE `%s` SET minutes=%d, cost=%s, kind='opening-net' WHERE id=%d", $T,
++                    $d['new_minutes'], db_input(sprintf('%.2f', $d['new_cost'])), $id));
++            $fixed[$d['ticket_id']] = $d['number'];
++        }
++        foreach (array_keys($fixed) as $tid)
++            TimeTrackingPlugin::updateTotals('T', $tid);
++        return $fixed;
++    }
 +
 +    /** Called from scp/timereports.php after staff.inc.php */
 +    static function page() {
@@ -4066,7 +4137,12 @@ index 0000000..a18bad3
 +                ? $_POST['basis'] : 'closed';
 +            $importMsg = self::runImport($basis, !empty($_POST['redate']));
 +        }
++        $fixMsg = null;
++        if ($thisstaff->isAdmin() && $_SERVER['REQUEST_METHOD'] === 'POST'
++                && @$_POST['tt_fixdup'])
++            $fixMsg = self::fixDoubleCounts();
 +        $importInfo = $thisstaff->isAdmin() ? self::importCandidates() : null;
++        $dupInfo = $thisstaff->isAdmin() ? self::doubleCounts() : array();
 +
 +        list($tree, $total) = self::rollup(self::entries($start, $end, $scope));
 +
@@ -4117,10 +4193,10 @@ index 0000000..a18bad3
 +}
 diff --git a/include/plugins/time-tracking/reports.tmpl.php b/include/plugins/time-tracking/reports.tmpl.php
 new file mode 100644
-index 0000000..429a7e9
+index 0000000..6a38a90
 --- /dev/null
 +++ b/include/plugins/time-tracking/reports.tmpl.php
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,331 @@
 +<?php
 +// Time & Cost Reports page body. Variables from TimeReports::page().
 +if (!defined('OSTSCPINC')) die('Access Denied');
@@ -4214,6 +4290,38 @@ index 0000000..429a7e9
 +     if (count($importMsg['skipped']) > 20) echo ' &hellip; and ' . (count($importMsg['skipped']) - 20) . ' more'; ?>
 +  <?php } ?>
 +</div>
++<?php }
++if ($fixMsg) { ?>
++<div id="msg_notice" style="margin-bottom:10px">
++  Fixed double-counted time on <?php echo count($fixMsg); ?> ticket(s): <?php
++  echo $h(implode(', ', array_map(function($n) { return '#' . $n; }, array_values($fixMsg)))); ?>.
++</div>
++<?php }
++if ($dupInfo) {
++  $dupMin = 0; $dupCost = 0;
++  foreach ($dupInfo as $d) { $dupMin += $d['dup_minutes']; $dupCost += $d['dup_cost']; } ?>
++<form method="post" action="<?php echo $h('timereports.php?' . Http::build_query($_GET)); ?>" class="ttr-filter" style="background:#fdecea;border-color:#e3a39c">
++  <?php csrf_token(); ?>
++  <input type="hidden" name="tt_fixdup" value="1">
++  <strong><i class="icon-warning-sign"></i> Time counted twice:</strong>
++  <?php echo count($dupInfo); ?> ticket(s) have an opening total that repeats time already logged on their tasks
++  (<?php echo $hours($dupMin); ?>, <?php echo $h($money($dupCost)); ?> in all). Earlier versions of the plugin
++  imported a ticket's Time/Cost value, which already included its tasks, as the ticket's own time.
++  <table class="ttr" style="width:auto;margin:6px 0">
++    <thead><tr><th>Ticket</th><th class="num">Ticket's own (now)</th><th class="num">Repeated task time</th><th class="num">Ticket's own (fixed)</th></tr></thead>
++    <tbody>
++    <?php foreach (array_slice($dupInfo, 0, 15, true) as $d) { ?>
++      <tr><td><a href="tickets.php?id=<?php echo $d['ticket_id']; ?>">#<?php echo $h($d['number']); ?></a></td>
++        <td class="num"><?php echo $hours($d['minutes']) . ' · ' . $h($money($d['cost'])); ?></td>
++        <td class="num"><?php echo $hours($d['dup_minutes']) . ' · ' . $h($money($d['dup_cost'])); ?></td>
++        <td class="num"><?php echo $hours($d['new_minutes']) . ' · ' . $h($money($d['new_cost'])); ?></td></tr>
++    <?php } ?>
++    </tbody>
++  </table>
++  <?php if (count($dupInfo) > 15) echo '<div class="faded">&hellip; and ' . (count($dupInfo) - 15) . ' more</div>'; ?>
++  <input type="submit" value="Fix" onclick="return confirm('Remove the repeated task time from these tickets\' opening totals?');">
++  <span class="faded">Admins only. Tasks' own time is not changed; the tickets' Time/Cost fields are recalculated.</span>
++</form>
 +<?php }
 +if ($importInfo) {
 +  list($cand, $redateCount) = $importInfo;
@@ -4422,10 +4530,10 @@ index 0000000..429a7e9
 +</script>
 diff --git a/include/plugins/time-tracking/timetracking.php b/include/plugins/time-tracking/timetracking.php
 new file mode 100644
-index 0000000..7e7a4f7
+index 0000000..59e015e
 --- /dev/null
 +++ b/include/plugins/time-tracking/timetracking.php
-@@ -0,0 +1,477 @@
+@@ -0,0 +1,503 @@
 +<?php
 +/*********************************************************************
 + * Time & Cost Tracking plugin for osTicket 1.17 / 1.18
@@ -4662,7 +4770,26 @@ index 0000000..7e7a4f7
 +        return $a->save();   // fires model.updated -> refreshes __cdata tables
 +    }
 +
-+    /** First row for an object: import any hand-entered field values. */
++    /**
++     * Time / cost logged on a ticket's tasks: array(minutes, cost).
++     * With $beforeId, only rows created before that row id.
++     */
++    static function taskRowsTotal($ticketId, $beforeId=0) {
++        $res = db_query(sprintf(
++            "SELECT COALESCE(SUM(minutes),0) AS m, COALESCE(SUM(cost),0) AS c FROM `%s`
++             WHERE ticket_id=%d AND object_type='A'%s",
++            self::table(), $ticketId, $beforeId ? sprintf(' AND id < %d', $beforeId) : ''));
++        $row = $res ? db_fetch_array($res) : null;
++        return array((int) @$row['m'], (float) @$row['c']);
++    }
++
++    /**
++     * First row for an object: import any hand-entered field values.
++     *
++     * A ticket's Time / Cost fields hold the ticket's total INCLUDING its
++     * tasks, so time already logged on its tasks is subtracted: only the
++     * remainder belongs to the ticket itself.
++     */
 +    static function seedOpening($type, $objId, $ticketId) {
 +        if (self::objectHasRows($type, $objId))
 +            return;
@@ -4671,8 +4798,15 @@ index 0000000..7e7a4f7
 +            ? self::parseTime($a->get('value')) : null;
 +        $cost = ($a = self::getAnswer($type, $objId, $cf))
 +            ? self::parseCost($a->get('value')) : null;
++        if ($type === 'T') {
++            list($tm, $tc) = self::taskRowsTotal($objId);
++            $min = max(0, (int) $min - $tm);
++            $cost = max(0, round((float) $cost - $tc, 2));
++        }
 +        if ($min || $cost)
-+            self::insertRow($type, $objId, $ticketId, 0, 0, 'opening',
++            // 'opening-net': a ticket opening that already leaves out its
++            // tasks' time (see TimeReports::doubleCounts())
++            self::insertRow($type, $objId, $ticketId, 0, 0, $type === 'T' ? 'opening-net' : 'opening',
 +                (int) $min, (float) $cost);
 +    }
 +
