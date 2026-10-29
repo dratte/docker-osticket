@@ -1,3 +1,29 @@
+diff --git a/include/class.auth.php b/include/class.auth.php
+index 1481aee..90e4ab4 100644
+--- a/include/class.auth.php
++++ b/include/class.auth.php
+@@ -660,7 +660,10 @@ abstract class StaffAuthenticationBackend  extends AuthenticationBackend {
+         $authsession['2fa'] =  $auth2fa;
+         // Set TIME_BOMB to regenerate the session 10 seconds after login
+         $_SESSION['TIME_BOMB'] = time() + 10;
+-        // Set session token
++        // Set session token. Drop any token left in this session: one made
++        // before a restart (different client IP or SECRET_SALT) never
++        // validates again and would block every login from this browser.
++        unset($_SESSION[':token']['staff']);
+         $staff->setSessionToken();
+         // Set Auth Key
+         $staff->setAuthKey($authkey);
+@@ -852,7 +855,8 @@ abstract class UserAuthenticationBackend  extends AuthenticationBackend {
+ 
+         // Tag the user and associated ticket in the SESSION
+         $this->setAuthKey($user, $bk, $authkey);
+-        // Set Session Token
++        // Set Session Token (fresh one, see staff login above)
++        unset($_SESSION[':token']['client']);
+         $user->setSessionToken();
+         //The backend used decides the format of the auth key.
+         // XXX: encrypt to hide the bk??
 diff --git a/include/class.nav.php b/include/class.nav.php
 index d0f14b0..eecd4bf 100644
 --- a/include/class.nav.php
